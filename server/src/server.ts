@@ -20,6 +20,8 @@ const ERASE_COOLDOWN_MS = 250; // per-connection rate limit on erase, per the GD
 // erasing doesn't strain physics the way drawing does (it only ever removes bodies), so this is
 // deliberately looser than DRAW_COOLDOWN_MS; it just keeps a spam-right-clicker from hammering
 // storage.delete() and broadcast() rather than gating a gameplay mechanic
+const MAX_CHAT_LENGTH = 240; // generous for a quick line of chat — comfortably under anything that'd overwhelm the log; enforced here AND as the client's <input maxlength>, but this copy is the one that actually matters
+const CHAT_COOLDOWN_MS = 400; // per-connection rate limit, per the GDD's "Rate Limiting" guidance — looser than DRAW_COOLDOWN_MS (chat never touches physics) but tight enough to block flooding; the same "spam guard, not a gameplay gate" posture ERASE_COOLDOWN_MS established
 const COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
 const MAX_USERNAME_LENGTH = 20;
 const DEFAULT_AVATAR_COLOR = "#f4c95d";
@@ -50,6 +52,17 @@ function sanitizeUsername(raw: unknown): string {
 
 function sanitizeColor(raw: unknown): string {
   return typeof raw === "string" && COLOR_PATTERN.test(raw) ? raw : DEFAULT_AVATAR_COLOR;
+}
+
+// Per the GDD's "XSS via Usernames and Chat" guidance: strip control characters
+// and length-cap before a message ever reaches broadcast — canvas `fillText`
+// doesn't parse HTML, but an unsanitized string could still spoof other UI text
+// or blow past layout bounds. Unlike sanitizeUsername there's no placeholder
+// fallback for empty input: a message that's blank after sanitizing (e.g. all
+// whitespace, or all control characters) just isn't worth sending — handleChat
+// drops it rather than broadcasting nothing meaningful.
+function sanitizeChatText(raw: string): string {
+  return raw.replace(CONTROL_CHARS, "").trim().slice(0, MAX_CHAT_LENGTH);
 }
 
 type Keys = { left: boolean; right: boolean; jump: boolean };
@@ -100,6 +113,15 @@ function isValidErase(data: unknown): data is { type: "erase"; id: string } {
   return type === "erase" && typeof id === "string";
 }
 
+// Chat messages carry only the text — identity (username/color) is read from
+// this connection's own server-tracked PlayerState in handleChat, never trusted
+// from the message itself, so there's nothing here for a client to spoof.
+function isValidChat(data: unknown): data is { type: "chat"; text: string } {
+  if (typeof data !== "object" || data === null) return false;
+  const { type, text } = data as Record<string, unknown>;
+  return type === "chat" && typeof text === "string";
+}
+
 // Chain of thin static rectangles, one per consecutive point pair — identical
 // to the prototype's pointsToBodies; deterministic so every client can
 // regenerate matching cosmetic geometry from the same point array.
@@ -148,6 +170,7 @@ export default class Server implements Party.Server {
   platforms = new Map<string, PlatformState>();
   lastDrawAt = new Map<string, number>(); // connection id -> ms timestamp, for rate limiting
   lastEraseAt = new Map<string, number>(); // connection id -> ms timestamp, for rate limiting
+  lastChatAt = new Map<string, number>(); // connection id -> ms timestamp, for rate limiting
   tick = 0;
 
   constructor(readonly room: Party.Room) {}
@@ -327,6 +350,7 @@ export default class Server implements Party.Server {
     this.players.delete(conn.id);
     this.lastDrawAt.delete(conn.id);
     this.lastEraseAt.delete(conn.id);
+    this.lastChatAt.delete(conn.id);
     this.room.broadcast(JSON.stringify({ type: "player_left", id: conn.id }));
   }
 
@@ -351,6 +375,11 @@ export default class Server implements Party.Server {
 
     if (isValidErase(data)) {
       await this.handleErase(data, sender);
+      return;
+    }
+
+    if (isValidChat(data)) {
+      this.handleChat(data, sender);
       return;
     }
 
@@ -402,6 +431,33 @@ export default class Server implements Party.Server {
     await this.room.storage.delete(data.id);
 
     this.room.broadcast(JSON.stringify({ type: "platform_removed", id: data.id }));
+  }
+
+  // Sanitizes and rate-limits a chat message, then broadcasts it to everyone —
+  // including the sender, the same "no special-cased local preview" pattern
+  // handleDraw/handleErase established for platforms. Username/color are read
+  // from this connection's own tracked PlayerState (set once at onConnect,
+  // already sanitized) rather than the message itself — the client supplies
+  // only the text, so there's nothing here for it to spoof. Deliberately not
+  // persisted: unlike platforms — part of the shared, persistent world that
+  // must survive a restart — chat is just the room's live conversation, with
+  // no "restore on restart" expectation (contrast handleDraw's storage.put).
+  private handleChat(data: { text: string }, sender: Party.Connection) {
+    const now = Date.now();
+    const last = this.lastChatAt.get(sender.id) ?? 0;
+    if (now - last < CHAT_COOLDOWN_MS) return;
+
+    const text = sanitizeChatText(data.text);
+    if (text.length === 0) return; // nothing worth broadcasting once sanitized (e.g. all-whitespace)
+
+    const state = this.players.get(sender.id);
+    if (!state) return; // shouldn't happen on a live connection — guards a theoretical onMessage/onClose race
+
+    this.lastChatAt.set(sender.id, now);
+
+    this.room.broadcast(
+      JSON.stringify({ type: "chat", id: sender.id, username: state.username, color: state.color, text })
+    );
   }
 
   // Direct-velocity movement and a one-shot, ground-gated jump — identical

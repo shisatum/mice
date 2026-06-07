@@ -15,6 +15,7 @@ const MIN_POINT_DISTANCE = 4; // px — minimum spacing between captured drawing
 const RDP_EPSILON = 2; // px — Ramer-Douglas-Peucker tolerance; the bandwidth optimization the prototype deferred (see CLAUDE.md)
 const ERASE_HIT_TOLERANCE = PLATFORM_THICKNESS / 2 + 6; // px — how close a right-click must land to a platform's stroke to erase it; a little forgiveness beyond the visual half-thickness so thin/precise strokes stay easy to target
 const OWN_PLATFORM_HIGHLIGHT = "#6ee7b7"; // matches drawPlayers' "(you)" outline — reused here so "this is yours" reads as one consistent visual language
+const MAX_CHAT_LENGTH = 240; // mirrors the server's MAX_CHAT_LENGTH — caps the <input> so nothing gets typed that the server would just truncate anyway
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 canvas.width = WORLD_WIDTH;
@@ -63,6 +64,15 @@ type PlayerSnapshot = { id: string; x: number; y: number; vx: number; vy: number
 type Point = { x: number; y: number };
 type Platform = { id: string; points: Point[]; color: string; owner: string };
 type Identity = { username: string; color: string };
+
+// A line in the chat log — either a real chat message (rendered as a colored
+// username + text, mirroring how avatars show identity) or a system note for
+// join/leave events (rendered muted/italic, like .join-hint). System entries
+// are derived client-side from player_joined/player_left — see the chat setup
+// in startGame for why that's preferable to a dedicated protocol message.
+type ChatEntry =
+  | { kind: "chat"; username: string; color: string; text: string }
+  | { kind: "system"; text: string };
 
 const DEFAULT_AVATAR_COLOR = "#f4c95d"; // matches the server's DEFAULT_AVATAR_COLOR fallback
 
@@ -216,6 +226,7 @@ function startGame(roomId: string, identity: Identity) {
   const keys = { left: false, right: false, jump: false };
 
   function setKey(code: string, value: boolean) {
+    if (chatOpen) return; // the chat input owns the keyboard while it's open — see the chat setup further down
     let changed = false;
     switch (code) {
       case "ArrowLeft":
@@ -282,6 +293,109 @@ function startGame(roomId: string, identity: Identity) {
     if (target) conn.send(JSON.stringify({ type: "erase", id: target.id }));
   });
 
+  // Chat — toggled open/closed with Enter (the window-level handler at the
+  // bottom of this block). Collapsed, the log clips to its most recent lines —
+  // a passive "ticker" so a message never goes unseen mid-game without taking
+  // over the screen; expanded, it becomes a full scrollable history with an
+  // input box that takes over the keyboard (see setKey's `chatOpen` guard
+  // above, and the held-key release below).
+  //
+  // Join/leave log entries are deliberately *not* a separate protocol message —
+  // they're derived right here from player_joined/player_left, the very
+  // messages the roster already tracks. That keeps join/leave wording
+  // consistent with however names are actually displayed (sanitized/fallback-
+  // applied, never raw user input) for free, with no extra server bookkeeping
+  // and no second source of truth for "who's in the room" to drift out of sync.
+  let chatOpen = false;
+  const MAX_CHAT_LOG = 200; // caps DOM growth over a long session — generous for "scroll back to see what you missed"
+
+  const chatPanel = document.createElement("div");
+  chatPanel.id = "chat";
+
+  const chatLogEl = document.createElement("div");
+  chatLogEl.classList.add("chat-log");
+  chatPanel.appendChild(chatLogEl);
+
+  const chatInput = document.createElement("input");
+  chatInput.classList.add("chat-input");
+  chatInput.placeholder = "Press Enter to chat…";
+  chatInput.maxLength = MAX_CHAT_LENGTH;
+  chatInput.autocomplete = "off";
+  chatPanel.appendChild(chatInput);
+
+  document.body.appendChild(chatPanel);
+
+  function appendChatEntry(entry: ChatEntry) {
+    const line = document.createElement("div");
+    line.classList.add("chat-entry");
+    if (entry.kind === "system") {
+      line.classList.add("chat-system");
+      line.textContent = entry.text;
+    } else {
+      const name = document.createElement("span");
+      name.classList.add("chat-username");
+      name.style.color = entry.color;
+      name.textContent = entry.username;
+      // textContent (+ a plain text node) for both pieces, never innerHTML —
+      // per the GDD's "XSS via Usernames and Chat" guidance, nothing
+      // user-supplied is ever parsed as markup, only ever rendered as inert text.
+      line.append(name, document.createTextNode(`: ${entry.text}`));
+    }
+    chatLogEl.appendChild(line);
+    while (chatLogEl.children.length > MAX_CHAT_LOG) chatLogEl.firstElementChild?.remove();
+    chatLogEl.scrollTop = chatLogEl.scrollHeight;
+  }
+
+  function setChatOpen(open: boolean) {
+    if (chatOpen === open) return;
+    chatOpen = open;
+    chatPanel.classList.toggle("expanded", open);
+    if (open) {
+      // The chat input is about to own the keyboard. Release any movement keys
+      // held at this exact instant — without this, a key held down at the
+      // moment chat opens would never see its matching keyup (setKey ignores
+      // both while chatOpen is true), leaving the avatar "stuck" running for as
+      // long as the panel stays open.
+      if (keys.left || keys.right || keys.jump) {
+        keys.left = keys.right = keys.jump = false;
+        conn.send(JSON.stringify({ type: "input", keys }));
+      }
+      chatInput.focus();
+      chatLogEl.scrollTop = chatLogEl.scrollHeight;
+    } else {
+      chatInput.value = "";
+      chatInput.blur();
+    }
+  }
+
+  chatInput.addEventListener("keydown", (event) => {
+    // Stop here — the window-level handlers below (movement capture and the
+    // closed-state "open chat" trigger) must never see keystrokes meant for
+    // composing a message. This is also what keeps setKey's chatOpen guard from
+    // ever mattering while actually typing; that guard only earns its keep if
+    // focus drifts away from this input while the panel stays open (e.g. a
+    // click on the canvas).
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const text = chatInput.value.trim();
+      if (text.length > 0) conn.send(JSON.stringify({ type: "chat", text }));
+      setChatOpen(false);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      setChatOpen(false);
+    }
+  });
+
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && document.activeElement !== chatInput) {
+      event.preventDefault();
+      setChatOpen(!chatOpen);
+    } else if (event.key === "Escape" && chatOpen) {
+      setChatOpen(false);
+    }
+  });
+
   conn.addEventListener("message", (event) => {
     let data: unknown;
     try {
@@ -328,6 +442,12 @@ function startGame(roomId: string, identity: Identity) {
       case "player_joined": {
         if (isString(msg.id) && isString(msg.username) && isString(msg.color)) {
           roster.set(msg.id, { username: msg.username, color: msg.color });
+          // Logged for everyone the broadcast reaches, including the joiner
+          // themselves — matching this project's established "no special-cased
+          // local preview" pattern (see CLAUDE.md / Phases 5-6) rather than
+          // reaching for a self-id check that conn.id might not even be
+          // populated by yet at this exact moment in the connection lifecycle.
+          appendChatEntry({ kind: "system", text: `${msg.username} joined` });
         } else {
           warnUnexpectedShape(msg.type, msg);
         }
@@ -335,7 +455,12 @@ function startGame(roomId: string, identity: Identity) {
       }
       case "player_left": {
         if (isString(msg.id)) {
+          // Look the username up *before* deleting — player_left only carries
+          // an id (see CLAUDE.md's note on not exposing more than usernames),
+          // and the roster is the only place this client knows that mapping.
+          const identity = roster.get(msg.id);
           roster.delete(msg.id);
+          if (identity) appendChatEntry({ kind: "system", text: `${identity.username} left` });
         } else {
           warnUnexpectedShape(msg.type, msg);
         }
@@ -352,6 +477,14 @@ function startGame(roomId: string, identity: Identity) {
       case "platform_removed": {
         if (isString(msg.id)) {
           platforms.delete(msg.id);
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
+        break;
+      }
+      case "chat": {
+        if (isString(msg.id) && isString(msg.username) && isString(msg.color) && isString(msg.text)) {
+          appendChatEntry({ kind: "chat", username: msg.username, color: msg.color, text: msg.text });
         } else {
           warnUnexpectedShape(msg.type, msg);
         }
