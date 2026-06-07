@@ -2,9 +2,7 @@
 
 A browser-based multiplayer game best described as **a whiteboard app meets Transformice**: players share a canvas where anyone can draw platforms in real time, and everyone's mouse avatars can physically jump and run on whatever gets drawn. The world is shaped by its players as they play.
 
-**Live at:**
-- Client: [https://mice.thardobodol.workers.dev](https://mice.thardobodol.workers.dev)
-- Server (PartyKit room): [https://mice.shisatum.partykit.dev](https://mice.shisatum.partykit.dev)
+**Live:** the game is deployed and playable — a PartyKit room (server) on PartyKit's managed platform, with the client served separately via Cloudflare Workers Static Assets. (Live URLs are intentionally not published here — ask the maintainer for a link, or follow [Deploying](#deploying) below to stand up your own instance.)
 
 ## Stack
 

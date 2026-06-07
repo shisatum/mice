@@ -211,9 +211,7 @@ The project has two independently deployed pieces: the **PartyKit server** (room
 
 > **Cloudflare Workers with Static Assets** is the current recommended approach for static front-ends on Cloudflare — Pages was moved to maintenance mode in April 2025. Workers Static Assets is functionally equivalent for this use case and is the forward-looking choice.
 
-**Currently live at:**
-- Server: `https://mice.shisatum.partykit.dev`
-- Client: `https://mice.thardobodol.workers.dev` (a custom domain such as `mice.ordulis.com` remains an optional follow-up — see Step 2 below — the game is fully playable without one)
+**Currently live** on exactly this architecture — a `mice.[partykit-username].partykit.dev` server and a `mice.[cloudflare-account].workers.dev` client (live URLs intentionally not recorded in this doc; see CLAUDE.md). A custom domain for the client remains an optional follow-up — see Step 2 below — the game is fully playable without one.
 
 ---
 
@@ -266,7 +264,7 @@ npx wrangler deploy
 This deploys the Worker and its static assets to a generated URL like `mice.[your-account].workers.dev`. Because the PartyKit host is baked into the bundle at build time, this client connects cross-origin (over WSS) straight to the PartyKit room *regardless of where it's served from* — no "point the client at the server" configuration step is needed; it's already correct by construction.
 
 **Optional — add a custom domain:**
-In the Cloudflare dashboard, go to **Workers & Pages → mice → Settings → Domains & Routes → Add Custom Domain**. Enter your domain (e.g. `mice.ordulis.com`). If that domain is already on Cloudflare DNS, it auto-creates the required DNS record and provisions an SSL certificate automatically — no manual DNS editing needed.
+In the Cloudflare dashboard, go to **Workers & Pages → mice → Settings → Domains & Routes → Add Custom Domain**. Enter your domain (e.g. `mice.yourdomain.com`). If that domain is already on Cloudflare DNS, it auto-creates the required DNS record and provisions an SSL certificate automatically — no manual DNS editing needed.
 
 The client would then be served from your custom domain while its WebSocket connection still goes to `.partykit.dev`. These are two separate origins, and that is expected and correct.
 
@@ -284,5 +282,5 @@ The client would then be served from your custom domain while its WebSocket conn
 
 | What | Where | URL |
 |---|---|---|
-| PartyKit server | PartyKit managed platform | `mice.shisatum.partykit.dev` |
-| Client (static) | Cloudflare Workers (Static Assets) | `mice.thardobodol.workers.dev` (custom domain optional) |
+| PartyKit server | PartyKit managed platform | `mice.[partykit-username].partykit.dev` |
+| Client (static) | Cloudflare Workers (Static Assets) | `mice.[cloudflare-account].workers.dev` (custom domain optional) |
