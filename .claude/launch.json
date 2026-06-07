@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "prototype-static",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "5500", "--directory", "prototype"],
+      "port": 5500
+    },
+    {
+      "name": "server-dev",
+      "runtimeExecutable": "D:\\LOVE\\code_projects\\mouse\\server\\dev.cmd",
+      "runtimeArgs": [],
+      "port": 1999
+    }
+  ]
+}

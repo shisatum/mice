@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mouse — single-player prototype</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1d23; overflow: hidden; }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+  #hint {
+    position: fixed; top: 8px; left: 12px; color: #c8ccd6;
+    font: 13px/1.4 system-ui, sans-serif; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="hint">Drag to draw a platform · Arrow keys / WASD to run · Up / W / Space to jump</div>
+<canvas id="canvas"></canvas>
+
+<script src="https://cdn.jsdelivr.net/npm/matter-js@0.20.0/build/matter.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  // ---- Setup -------------------------------------------------------------
+
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d");
+
+  function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  resizeCanvas();
+  window.addEventListener("resize", resizeCanvas);
+
+  const SEGMENT_THICKNESS = 10;   // px — thickness of drawn-platform collision segments
+  const MIN_POINT_DISTANCE = 4;   // px — minimum spacing between captured drawing points
+  const PLAYER_RADIUS = 16;
+  const MOVE_SPEED = 5;           // px/tick horizontal velocity while running
+  const JUMP_SPEED = 11;          // px/tick upward velocity applied on jump
+
+  const engine = Matter.Engine.create();
+  const world = engine.world;
+  engine.gravity.y = 1;
+
+  // Static ground so there's always something to stand on.
+  const ground = Matter.Bodies.rectangle(
+    window.innerWidth / 2, window.innerHeight - 20,
+    window.innerWidth * 4, 40,
+    { isStatic: true, label: "platform" }
+  );
+  Matter.World.add(world, ground);
+
+  const player = Matter.Bodies.circle(
+    window.innerWidth / 2, window.innerHeight - 200,
+    PLAYER_RADIUS,
+    {
+      label: "player",
+      friction: 0.05,
+      frictionAir: 0.01,
+      restitution: 0,
+      inertia: Infinity, // locked rotation — slides instead of rolling, looks right for a running mouse
+    }
+  );
+  Matter.World.add(world, player);
+
+  // ---- State --------------------------------------------------------------
+
+  // Each entry: { points: [{x,y}, ...], bodies: Matter.Body[] }
+  // Rendering reads `points`; physics reads `bodies`. This separation is the
+  // pattern the real multiplayer client needs too — render from the shared
+  // point array, not from physics-body geometry (pixel art is cosmetic only).
+  const platforms = [];
+
+  let drawing = null; // in-progress path while mouse is down: {x,y}[]
+
+  const keys = { left: false, right: false, jump: false };
+  let groundContacts = 0;
+  let grounded = false;
+  let jumpHeld = false; // edge-detect so holding jump doesn't repeatedly trigger
+
+  // ---- Drawing capture ----------------------------------------------------
+
+  function canvasPoint(evt) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: evt.clientX - rect.left, y: evt.clientY - rect.top };
+  }
+
+  function distance(a, b) {
+    return Math.hypot(b.x - a.x, b.y - a.y);
+  }
+
+  canvas.addEventListener("mousedown", (evt) => {
+    drawing = [canvasPoint(evt)];
+  });
+
+  canvas.addEventListener("mousemove", (evt) => {
+    if (!drawing) return;
+    const p = canvasPoint(evt);
+    if (distance(drawing[drawing.length - 1], p) >= MIN_POINT_DISTANCE) {
+      drawing.push(p);
+    }
+  });
+
+  function finishDrawing() {
+    if (!drawing) return;
+    if (drawing.length >= 2) {
+      platforms.push({ points: drawing, bodies: pointsToBodies(drawing) });
+    }
+    drawing = null;
+  }
+
+  window.addEventListener("mouseup", finishDrawing);
+  canvas.addEventListener("mouseleave", () => { /* keep drawing through brief leaves */ });
+
+  // ---- Path -> physics body ------------------------------------------------
+  //
+  // Chain of thin static rectangles, one per consecutive point pair. This
+  // handles arbitrary hand-drawn shapes (wavy lines, loops, zigzags) robustly.
+  // Matter.Bodies.fromVertices was considered but rejected: it expects/derives
+  // a polygon hull and mishandles concave or self-intersecting freehand paths.
+  //
+  // NOTE: deliberately NOT applying Ramer-Douglas-Peucker simplification here.
+  // RDP is a network-bandwidth optimization for the eventual drawing-sync
+  // phase (fewer points to transmit) — for a local single-player prototype,
+  // raw point density gives finer (more stable) collision geometry.
+  function pointsToBodies(points) {
+    const bodies = [];
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      const length = distance(a, b);
+      if (length < 0.5) continue; // skip degenerate zero-length segments
+      const angle = Math.atan2(b.y - a.y, b.x - a.x);
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const segment = Matter.Bodies.rectangle(mid.x, mid.y, length, SEGMENT_THICKNESS, {
+        isStatic: true,
+        angle,
+        label: "platform",
+      });
+      bodies.push(segment);
+    }
+    Matter.World.add(world, bodies);
+    return bodies;
+  }
+
+  // ---- Controls -------------------------------------------------------------
+
+  function setKey(code, value) {
+    switch (code) {
+      case "ArrowLeft": case "KeyA": keys.left = value; break;
+      case "ArrowRight": case "KeyD": keys.right = value; break;
+      case "ArrowUp": case "KeyW": case "Space": keys.jump = value; break;
+    }
+  }
+
+  window.addEventListener("keydown", (evt) => setKey(evt.code, true));
+  window.addEventListener("keyup", (evt) => setKey(evt.code, false));
+
+  // ---- Ground detection -----------------------------------------------------
+  //
+  // Tracks how many platform contacts currently support the player from above
+  // (roughly-vertical contact normal). A counter (rather than a boolean set on
+  // any contact) avoids flicker when standing across overlapping segments.
+  function isPlayerPlatformPair(pair) {
+    const { bodyA, bodyB } = pair;
+    if (bodyA === player && bodyB.label === "platform") return bodyB;
+    if (bodyB === player && bodyA.label === "platform") return bodyA;
+    return null;
+  }
+
+  function isSupportingContact(pair) {
+    const normal = pair.collision.normal; // points from bodyA to bodyB
+    // A vertical normal alone isn't enough — bumping your head on a platform's
+    // underside also produces a near-vertical normal, and would otherwise be
+    // miscounted as "standing on", letting a head-bump refresh the jump mid-air.
+    // Resolve which side the platform is on from the normal's sign relative to
+    // which body is the player: the platform only supports when it's *below*.
+    // Empirically verified (Matter 0.20 SAT normal convention is not "A to B"
+    // center-to-center): for a genuinely-supporting contact (platform below
+    // the player), normal.y is negative when the player is bodyA, and positive
+    // when the platform is bodyA. A head-bump (platform above) flips the sign.
+    if (pair.bodyA === player) return normal.y < -0.5;
+    return normal.y > 0.5;
+  }
+
+  Matter.Events.on(engine, "collisionStart", (event) => {
+    for (const pair of event.pairs) {
+      if (isPlayerPlatformPair(pair) && isSupportingContact(pair)) groundContacts++;
+    }
+  });
+
+  Matter.Events.on(engine, "collisionEnd", (event) => {
+    for (const pair of event.pairs) {
+      if (isPlayerPlatformPair(pair) && isSupportingContact(pair)) {
+        groundContacts = Math.max(0, groundContacts - 1);
+      }
+    }
+  });
+
+  // ---- Per-tick update -------------------------------------------------------
+
+  function updatePlayer() {
+    grounded = groundContacts > 0;
+
+    let vx = 0;
+    if (keys.left) vx -= MOVE_SPEED;
+    if (keys.right) vx += MOVE_SPEED;
+    Matter.Body.setVelocity(player, { x: vx, y: player.velocity.y });
+
+    if (keys.jump && !jumpHeld && grounded) {
+      Matter.Body.setVelocity(player, { x: player.velocity.x, y: -JUMP_SPEED });
+    }
+    jumpHeld = keys.jump;
+  }
+
+  // ---- Render loop ------------------------------------------------------------
+  //
+  // Custom rAF loop drawing primitives directly, deliberately not Matter.Render
+  // (a debug renderer tied 1:1 to physics-body geometry). Platforms are drawn
+  // from their original point arrays — establishing "render from shared point
+  // data" now, the same separation the networked client will need later.
+
+  function drawPlatform(points) {
+    if (points.length < 2) return;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+    ctx.strokeStyle = "#a3c4f3";
+    ctx.lineWidth = SEGMENT_THICKNESS;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.stroke();
+  }
+
+  function drawGround() {
+    ctx.fillStyle = "#3a3f4b";
+    ctx.fillRect(0, window.innerHeight - 40, window.innerWidth, 40);
+  }
+
+  function drawPlayer() {
+    ctx.beginPath();
+    ctx.arc(player.position.x, player.position.y, PLAYER_RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = grounded ? "#f4c95d" : "#e0905e";
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#1b1d23";
+    ctx.stroke();
+  }
+
+  function drawInProgressPath() {
+    if (!drawing || drawing.length < 2) return;
+    drawPlatform(drawing);
+  }
+
+  let lastTime = performance.now();
+
+  function frame(now) {
+    const delta = Math.min(now - lastTime, 50); // clamp to avoid huge steps after tab-away
+    lastTime = now;
+
+    updatePlayer();
+    Matter.Engine.update(engine, delta);
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    drawGround();
+    for (const platform of platforms) drawPlatform(platform.points);
+    drawInProgressPath();
+    drawPlayer();
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

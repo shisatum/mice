@@ -1,0 +1,133 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #1b1d23;
+  overflow: hidden;
+}
+
+canvas {
+  display: block;
+}
+
+#hint {
+  position: fixed;
+  top: 8px;
+  left: 12px;
+  color: #c8ccd6;
+  font: 13px/1.4 system-ui, sans-serif;
+  pointer-events: none;
+}
+
+#palette {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  background: rgba(27, 29, 35, 0.7);
+  border-radius: 999px;
+}
+
+.swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+}
+
+.swatch.selected {
+  border-color: #f4f6fb;
+}
+
+#join-screen {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(27, 29, 35, 0.92);
+  z-index: 10;
+}
+
+#join-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(360px, 90vw);
+  padding: 28px;
+  background: #23262f;
+  border: 1px solid #353a47;
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+  font: 14px/1.4 system-ui, sans-serif;
+  color: #c8ccd6;
+}
+
+#join-card h1 {
+  margin: 0;
+  color: #f4f6fb;
+  font-size: 28px;
+}
+
+#join-card p {
+  margin: 0;
+  color: #9aa0ad;
+}
+
+#join-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-weight: 600;
+  color: #f4f6fb;
+}
+
+#join-card input {
+  font: inherit;
+  padding: 8px 10px;
+  background: #1b1d23;
+  border: 1px solid #353a47;
+  border-radius: 8px;
+  color: #f4f6fb;
+}
+
+#join-card input:focus {
+  outline: 2px solid #6ee7b7;
+  outline-offset: 1px;
+}
+
+.join-field-label {
+  font-weight: 600;
+  color: #f4f6fb;
+}
+
+.swatch-row {
+  display: flex;
+  gap: 8px;
+}
+
+.join-hint {
+  font-size: 12px;
+  color: #6c7280;
+}
+
+#join-submit {
+  margin-top: 6px;
+  padding: 10px;
+  font: inherit;
+  font-weight: 700;
+  background: #6ee7b7;
+  border: none;
+  border-radius: 8px;
+  color: #1b1d23;
+  cursor: pointer;
+}
+
+#join-submit:hover {
+  background: #8af0c8;
+}
