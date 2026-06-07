@@ -7,6 +7,7 @@ const SUB_STEPS = Math.round(TICK_MS / SUB_STEP_MS); // step physics at ~60Hz in
 const WORLD_WIDTH = 1600;
 const WORLD_HEIGHT = 900;
 const GROUND_THICKNESS = 40;
+const WALL_THICKNESS = 40; // px — invisible boundary walls along the world's left/right/top edges (see onStart)
 const PLAYER_RADIUS = 16;
 const MOVE_SPEED = 5; // px/tick horizontal velocity while running — same feel as the prototype
 const JUMP_SPEED = 11; // px/tick upward velocity applied on jump
@@ -15,6 +16,10 @@ const PLATFORM_THICKNESS = 10; // px — matches the prototype's SEGMENT_THICKNE
 const MAX_DRAW_POINTS = 500; // generous cap on a single stroke's (already RDP-simplified) point count
 const DRAW_COOLDOWN_MS = 1000; // per the GDD's physics-spam guidance: max one new platform per player per second
 const MAX_PLATFORMS_PER_PLAYER = 10; // per the GDD's physics-spam guidance: cap active bodies per player
+const ERASE_COOLDOWN_MS = 250; // per-connection rate limit on erase, per the GDD's general "Rate Limiting" guidance —
+// erasing doesn't strain physics the way drawing does (it only ever removes bodies), so this is
+// deliberately looser than DRAW_COOLDOWN_MS; it just keeps a spam-right-clicker from hammering
+// storage.delete() and broadcast() rather than gating a gameplay mechanic
 const COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
 const MAX_USERNAME_LENGTH = 20;
 const DEFAULT_AVATAR_COLOR = "#f4c95d";
@@ -83,6 +88,18 @@ function isValidDraw(data: unknown): data is { type: "draw"; points: Point[]; co
   return points.every(isValidPoint);
 }
 
+// The id alone is enough to identify *which* platform — no further payload is
+// trusted or needed. Note that, by this game's deliberate "shared whiteboard"
+// design (anyone can erase anything), there is no owner check to bypass here:
+// trusting a client-claimed id grants nothing beyond what the permission model
+// already allows. The only things worth validating are the message shape and
+// that the platform still exists (handleErase checks the latter).
+function isValidErase(data: unknown): data is { type: "erase"; id: string } {
+  if (typeof data !== "object" || data === null) return false;
+  const { type, id } = data as Record<string, unknown>;
+  return type === "erase" && typeof id === "string";
+}
+
 // Chain of thin static rectangles, one per consecutive point pair — identical
 // to the prototype's pointsToBodies; deterministic so every client can
 // regenerate matching cosmetic geometry from the same point array.
@@ -130,6 +147,7 @@ export default class Server implements Party.Server {
   bodyIdToConnId = new Map<number, string>();
   platforms = new Map<string, PlatformState>();
   lastDrawAt = new Map<string, number>(); // connection id -> ms timestamp, for rate limiting
+  lastEraseAt = new Map<string, number>(); // connection id -> ms timestamp, for rate limiting
   tick = 0;
 
   constructor(readonly room: Party.Room) {}
@@ -146,7 +164,34 @@ export default class Server implements Party.Server {
       GROUND_THICKNESS,
       { isStatic: true, label: "platform" }
     );
-    Matter.World.add(this.engine.world, ground);
+
+    // Invisible boundary walls along the world's left/right/top edges. Without
+    // them a player can simply run — or, given a tall enough drawn structure,
+    // climb — straight past the visible canvas and disappear off-screen with
+    // no way back (the world has no camera/scrolling; everything within
+    // [0, WORLD_WIDTH] x [0, WORLD_HEIGHT] is the whole stage). Each wall sits
+    // just outside the world so its *inner* face is flush with the edge
+    // (x=0, x=WORLD_WIDTH, y=0), and is overlength to cover the corners.
+    //
+    // They reuse label "platform" rather than introducing a new label: the
+    // empirically-derived normal-sign check in registerGroundDetection already
+    // distinguishes "resting on top of" from "bumping into the side/underside
+    // of" *any* static body purely from contact geometry, so a side wall or
+    // ceiling can never be mistaken for ground to stand on and re-arm a jump.
+    const leftWall = Matter.Bodies.rectangle(
+      -WALL_THICKNESS / 2, WORLD_HEIGHT / 2, WALL_THICKNESS, WORLD_HEIGHT * 2,
+      { isStatic: true, label: "platform" }
+    );
+    const rightWall = Matter.Bodies.rectangle(
+      WORLD_WIDTH + WALL_THICKNESS / 2, WORLD_HEIGHT / 2, WALL_THICKNESS, WORLD_HEIGHT * 2,
+      { isStatic: true, label: "platform" }
+    );
+    const ceiling = Matter.Bodies.rectangle(
+      WORLD_WIDTH / 2, -WALL_THICKNESS / 2, WORLD_WIDTH * 2, WALL_THICKNESS,
+      { isStatic: true, label: "platform" }
+    );
+
+    Matter.World.add(this.engine.world, [ground, leftWall, rightWall, ceiling]);
 
     // Restore platforms drawn before a restart/hibernation — PartyKit guarantees
     // onStart finishes (including this await) before the first onConnect fires,
@@ -281,6 +326,7 @@ export default class Server implements Party.Server {
     this.bodyIdToConnId.delete(state.body.id);
     this.players.delete(conn.id);
     this.lastDrawAt.delete(conn.id);
+    this.lastEraseAt.delete(conn.id);
     this.room.broadcast(JSON.stringify({ type: "player_left", id: conn.id }));
   }
 
@@ -300,6 +346,11 @@ export default class Server implements Party.Server {
 
     if (isValidDraw(data)) {
       await this.handleDraw(data, sender);
+      return;
+    }
+
+    if (isValidErase(data)) {
+      await this.handleErase(data, sender);
       return;
     }
 
@@ -326,6 +377,31 @@ export default class Server implements Party.Server {
     await this.room.storage.put(id, platformData);
 
     this.room.broadcast(JSON.stringify({ type: "platform_added", id, ...platformData }));
+  }
+
+  // Removes a platform's bodies from the live world, drops it from the
+  // registry, and erases its persisted record — then broadcasts the removal
+  // to everyone (including the eraser, mirroring handleDraw's "no special-cased
+  // local preview" pattern). By this game's deliberate "anyone can erase
+  // anything" design (see CLAUDE.md), there's no owner check: any connection
+  // may name any existing platform id. A short per-connection cooldown is the
+  // only gate, guarding storage/broadcast traffic against spam-clicking rather
+  // than gating a gameplay mechanic the way DRAW_COOLDOWN_MS does.
+  private async handleErase(data: { id: string }, sender: Party.Connection) {
+    const now = Date.now();
+    const last = this.lastEraseAt.get(sender.id) ?? 0;
+    if (now - last < ERASE_COOLDOWN_MS) return;
+
+    const platform = this.platforms.get(data.id);
+    if (!platform) return; // already erased by someone else, or never existed — nothing to do
+
+    this.lastEraseAt.set(sender.id, now);
+
+    Matter.World.remove(this.engine.world, platform.bodies);
+    this.platforms.delete(data.id);
+    await this.room.storage.delete(data.id);
+
+    this.room.broadcast(JSON.stringify({ type: "platform_removed", id: data.id }));
   }
 
   // Direct-velocity movement and a one-shot, ground-gated jump — identical
