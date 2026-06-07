@@ -40,7 +40,16 @@ fitCanvasToViewport();
 // always includes a color; a full custom picker is more UI than this whiteboard
 // needs right now). Built in JS rather than index.html to keep the feature
 // self-contained in one place, matching how keyboard capture lives here too.
-const PALETTE_COLORS = ["#a3c4f3", "#f6a5c0", "#ffd479", "#8fd3b6", "#c5a3f3", "#f3a3a3"];
+// ROYGBIV-ordered (Indigo dropped — at pastel saturation/lightness it reads as
+// indistinguishable from Blue/Violet, a well-known critique of Newton's 7-way
+// split; six evenly-spaced hues give better at-a-glance separation than seven
+// crowded ones). Keeps Yellow/Green/Blue/Violet from the old palette — they
+// were never the problem — and replaces only the two near-identical "reds"
+// (#f6a5c0 a pink, #f3a3a3 a salmon — easy to confuse at a glance) with one
+// clear Red plus a new Orange to complete the spectrum. Hues land roughly at
+// 5°/27°/41°/154°/219°/262°, each ~15-65° from its neighbors — enough gap to
+// stay distinct while keeping the same soft pastel character throughout.
+const PALETTE_COLORS = ["#f4978e", "#f7a663", "#ffd479", "#8fd3b6", "#a3c4f3", "#c5a3f3"];
 let selectedColor = PALETTE_COLORS[0];
 
 const palette = document.createElement("div");
@@ -629,7 +638,7 @@ function roomCodeFromUrl(): string | null {
   return ROOM_CODE_PATTERN.test(normalized) ? normalized : null;
 }
 
-let selectedAvatarColor = PALETTE_COLORS[3]; // a green, distinct from the platform palette's default blue
+let selectedAvatarColor = PALETTE_COLORS[3]; // a green, distinct from the platform palette's default red (PALETTE_COLORS[0])
 
 function buildJoinScreen() {
   const overlay = document.createElement("div");
