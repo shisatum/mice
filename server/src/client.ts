@@ -27,8 +27,10 @@ const ctx = canvas.getContext("2d")!;
 // untouched.
 function fitCanvasToViewport() {
   const scale = Math.min(window.innerWidth / WORLD_WIDTH, window.innerHeight / WORLD_HEIGHT);
-  canvas.style.width = `${WORLD_WIDTH * scale}px`;
-  canvas.style.height = `${WORLD_HEIGHT * scale}px`;
+  // Round to whole CSS pixels — a fixed-resolution canvas stretched to a
+  // sub-pixel size gets blurred by the browser's scaling/anti-aliasing.
+  canvas.style.width = `${Math.round(WORLD_WIDTH * scale)}px`;
+  canvas.style.height = `${Math.round(WORLD_HEIGHT * scale)}px`;
 }
 window.addEventListener("resize", fitCanvasToViewport);
 fitCanvasToViewport();
@@ -44,7 +46,7 @@ const palette = document.createElement("div");
 palette.id = "palette";
 for (const color of PALETTE_COLORS) {
   const swatch = document.createElement("button");
-  swatch.className = "swatch";
+  swatch.classList.add("swatch");
   swatch.style.backgroundColor = color;
   swatch.setAttribute("aria-label", `Draw in ${color}`);
   swatch.classList.toggle("selected", color === selectedColor);
@@ -101,8 +103,30 @@ function findPlatformAt(point: Point): Platform | null {
   return closest;
 }
 
+// Narrows an arbitrary JSON-decoded value down to "a non-null object whose
+// string-keyed properties we can safely probe" — the minimal common shape
+// every server message must have before we can even look at its `type`.
 function asRecord(data: unknown): Record<string, unknown> | null {
   return typeof data === "object" && data !== null ? (data as Record<string, unknown>) : null;
+}
+
+// Shape-check vocabulary for inbound server messages — see CLAUDE.md's
+// "Client-side validation posture toward the server" convention. The server
+// is the sole source of truth and already deep-validates every message's
+// fields before it ever broadcasts (gdd_partykit.md's "Schema Validation"/
+// "Numbers Only" sections), so the client's job is only to confirm a message
+// has the *shape* its declared type promises — right top-level keys, roughly-
+// right primitive types — not to re-derive the server's own per-field
+// validation a second time (two independent copies of "what does a valid
+// Platform look like" will only drift apart over time). Anything that claims
+// a known `type` but fails even this minimal check isn't "untrusted input"
+// (filtering that is the server's job): it's a bug worth knowing about — a
+// stale client, a version-skewed deploy, a protocol typo — so it's logged
+// rather than silently dropped.
+const isString = (v: unknown): v is string => typeof v === "string";
+
+function warnUnexpectedShape(type: string, msg: Record<string, unknown>) {
+  console.warn(`Ignoring "${type}" message from server — unexpected shape:`, msg);
 }
 
 function distance(a: Point, b: Point): number {
@@ -263,55 +287,78 @@ function startGame(roomId: string, identity: Identity) {
     try {
       data = JSON.parse(event.data);
     } catch {
+      console.warn("Ignoring malformed (non-JSON) message from server:", event.data);
       return;
     }
     const msg = asRecord(data);
-    if (!msg) return;
+    if (!msg) {
+      console.warn("Ignoring non-object message from server:", data);
+      return;
+    }
 
+    // Every case below follows the same "right shape, or warn" structure —
+    // see the isString/warnUnexpectedShape doc comment above for why this
+    // uniformity (and the logging) matters more than it might look like it does.
     switch (msg.type) {
-      case "snapshot":
-        if (Array.isArray(msg.players)) latestPlayers = msg.players as PlayerSnapshot[];
+      case "snapshot": {
+        if (Array.isArray(msg.players)) {
+          latestPlayers = msg.players as PlayerSnapshot[];
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
         break;
-      case "world_state":
+      }
+      case "world_state": {
         // Full roster/platform replacement on join — replaces any stale entries
         // from a previous connection to this room (e.g. after a reconnect).
-        if (Array.isArray(msg.players)) {
+        // Both arrays are required together: a message that's half-valid is
+        // just as much "not the shape we expected" as one that's all wrong.
+        if (Array.isArray(msg.players) && Array.isArray(msg.platforms)) {
           roster.clear();
           for (const p of msg.players as { id: string; username: string; color: string }[]) {
             roster.set(p.id, { username: p.username, color: p.color });
           }
-        }
-        if (Array.isArray(msg.platforms)) {
           platforms.clear();
           for (const p of msg.platforms as Platform[]) platforms.set(p.id, p);
+        } else {
+          warnUnexpectedShape(msg.type, msg);
         }
         break;
-      case "player_joined":
-        if (typeof msg.id === "string" && typeof msg.username === "string" && typeof msg.color === "string") {
+      }
+      case "player_joined": {
+        if (isString(msg.id) && isString(msg.username) && isString(msg.color)) {
           roster.set(msg.id, { username: msg.username, color: msg.color });
+        } else {
+          warnUnexpectedShape(msg.type, msg);
         }
         break;
-      case "player_left":
-        if (typeof msg.id === "string") roster.delete(msg.id);
-        break;
-      case "platform_added":
-        if (
-          typeof msg.id === "string" &&
-          Array.isArray(msg.points) &&
-          typeof msg.color === "string" &&
-          typeof msg.owner === "string"
-        ) {
-          platforms.set(msg.id, {
-            id: msg.id,
-            points: msg.points as Point[],
-            color: msg.color,
-            owner: msg.owner,
-          });
+      }
+      case "player_left": {
+        if (isString(msg.id)) {
+          roster.delete(msg.id);
+        } else {
+          warnUnexpectedShape(msg.type, msg);
         }
         break;
-      case "platform_removed":
-        if (typeof msg.id === "string") platforms.delete(msg.id);
+      }
+      case "platform_added": {
+        if (isString(msg.id) && Array.isArray(msg.points) && isString(msg.color) && isString(msg.owner)) {
+          platforms.set(msg.id, { id: msg.id, points: msg.points as Point[], color: msg.color, owner: msg.owner });
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
         break;
+      }
+      case "platform_removed": {
+        if (isString(msg.id)) {
+          platforms.delete(msg.id);
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
+        break;
+      }
+      default:
+        console.warn("Ignoring message from server with unrecognized type:", msg.type);
     }
   });
 
@@ -441,8 +488,9 @@ function buildJoinScreen() {
 
   const nameLabel = document.createElement("label");
   nameLabel.textContent = "Name";
+  // No id: the <label> wraps this input directly (an implicit label
+  // association — no `for`/`id` pairing needed), and nothing else looks it up.
   const nameInput = document.createElement("input");
-  nameInput.id = "join-username";
   nameInput.maxLength = MAX_USERNAME_LENGTH;
   nameInput.placeholder = "Cheddar";
   nameInput.autocomplete = "off";
@@ -450,17 +498,19 @@ function buildJoinScreen() {
   card.appendChild(nameLabel);
 
   const colorLabel = document.createElement("div");
-  colorLabel.className = "join-field-label";
+  colorLabel.classList.add("join-field-label");
   colorLabel.textContent = "Color";
   card.appendChild(colorLabel);
 
+  // No id here: nothing looks this element up by id, and ".swatch-row" alone
+  // already carries all of its styling (see CLAUDE.md's "id vs. class" — an id
+  // with neither a CSS rule nor a lookup is just an unused name to track).
   const colorPicker = document.createElement("div");
-  colorPicker.id = "avatar-color-picker";
-  colorPicker.className = "swatch-row";
+  colorPicker.classList.add("swatch-row");
   for (const color of PALETTE_COLORS) {
     const swatch = document.createElement("button");
     swatch.type = "button";
-    swatch.className = "swatch";
+    swatch.classList.add("swatch");
     swatch.style.backgroundColor = color;
     swatch.setAttribute("aria-label", `Use avatar color ${color}`);
     swatch.classList.toggle("selected", color === selectedAvatarColor);
@@ -475,8 +525,8 @@ function buildJoinScreen() {
 
   const roomLabel = document.createElement("label");
   roomLabel.textContent = "Room code";
+  // Same reasoning as nameInput above — implicitly labeled, never looked up.
   const roomInput = document.createElement("input");
-  roomInput.id = "join-room";
   roomInput.maxLength = 12;
   roomInput.autocomplete = "off";
   roomInput.value = roomCodeFromUrl() ?? generateRoomCode();
@@ -484,7 +534,7 @@ function buildJoinScreen() {
   card.appendChild(roomLabel);
 
   const hint = document.createElement("p");
-  hint.className = "join-hint";
+  hint.classList.add("join-hint");
   hint.textContent = "Share the room code (or this page's URL) with friends to play together.";
   card.appendChild(hint);
 
