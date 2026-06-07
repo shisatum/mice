@@ -60,6 +60,8 @@ The client doesn't need its own build step — step 1 already produced a complet
 ```toml
 name = "mice"
 compatibility_date = "2025-01-01"
+workers_dev = false
+preview_urls = false
 
 [assets]
 directory = "./public"
@@ -71,7 +73,7 @@ Then, from inside `server/`:
 npx wrangler deploy
 ```
 
-This publishes the Worker and its static assets to a generated URL like `mice.[your-account].workers.dev` — because the host is baked in, this client connects cross-origin (over WSS) straight to the PartyKit room regardless of where it's served from.
+By default (i.e. without `workers_dev`/`preview_urls` set), this publishes the Worker and its static assets to a generated URL like `mice.[your-account].workers.dev`, and Wrangler also mints a fresh preview URL on every deploy. This project disables both — `workers_dev = false` and `preview_urls = false` — because it's served from a custom domain (see step 3 below) and there's no need for the generic `.workers.dev` URL or auto-generated preview URLs to also be publicly reachable. **If you're standing up your own instance and don't plan to add a custom domain (or simply want the `.workers.dev` URL as your primary address), delete these two lines — or set them back to `true` — so Wrangler deploys to the `.workers.dev` subdomain as usual.** Either way, because the PartyKit host is baked into the bundle at build time, the client connects cross-origin (over WSS) straight to the PartyKit room regardless of where it's served from.
 
 ### 3. (Optional) Add a custom domain
 
