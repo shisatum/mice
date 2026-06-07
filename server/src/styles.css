@@ -31,6 +31,21 @@ canvas {
   border-radius: 999px;
 }
 
+/* Sits just above #palette (which spans bottom:16px to ~60px — 28px swatch
+   height + 2x8px padding — hence bottom:68px for a clean ~8px gap), centered
+   to match it visually. Muted/small like #hint and .join-hint, since it's
+   informational chrome rather than something to interact with. */
+#ink-meter {
+  position: fixed;
+  bottom: 68px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #9aa0ad;
+  font: 12px/1.4 system-ui, sans-serif;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
+
 .swatch {
   width: 28px;
   height: 28px;

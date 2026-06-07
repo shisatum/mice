@@ -15,7 +15,19 @@ const JUMP_SPEED = 11; // px/tick upward velocity applied on jump
 const PLATFORM_THICKNESS = 10; // px — matches the prototype's SEGMENT_THICKNESS
 const MAX_DRAW_POINTS = 500; // generous cap on a single stroke's (already RDP-simplified) point count
 const DRAW_COOLDOWN_MS = 1000; // per the GDD's physics-spam guidance: max one new platform per player per second
-const MAX_PLATFORMS_PER_PLAYER = 10; // per the GDD's physics-spam guidance: cap active bodies per player
+// "Ink" budget — per the GDD's physics-spam guidance: cap active bodies per
+// player. This replaces an earlier flat MAX_PLATFORMS_PER_PLAYER=10 cap with a
+// segment-based one: createPlatformBodies emits one physics body per
+// consecutive point pair, so a platform's *real* cost is its segment count,
+// not "1 platform" regardless of length — a flat per-platform cap let a
+// maximally-long single stroke (up to MAX_DRAW_POINTS-1 segments) cost the same
+// "1" as a single dot, a ~70x spread between typical and worst-case load. 200
+// is roomier in the typical case (real RDP-simplified strokes run ~5-10
+// segments each, so this is "20-40 strokes" vs the old cap's flat 10) while
+// also *tightening* the worst-case bound (200 segments total vs the old
+// scheme's de-facto 10 x 499 ≈ 4990). See sendInkUpdate for how players see
+// their remaining budget as "ink left".
+const MAX_SEGMENTS_PER_PLAYER = 200;
 const ERASE_COOLDOWN_MS = 250; // per-connection rate limit on erase, per the GDD's general "Rate Limiting" guidance —
 // erasing doesn't strain physics the way drawing does (it only ever removes bodies), so this is
 // deliberately looser than DRAW_COOLDOWN_MS; it just keeps a spam-right-clicker from hammering
@@ -120,6 +132,18 @@ function isValidChat(data: unknown): data is { type: "chat"; text: string } {
   if (typeof data !== "object" || data === null) return false;
   const { type, text } = data as Record<string, unknown>;
   return type === "chat" && typeof text === "string";
+}
+
+// Upper-bound estimate of how many physics bodies a point array will produce —
+// createPlatformBodies emits one rectangle per consecutive point pair, skipping
+// only true degenerate (sub-half-pixel) ones, so points.length-1 never
+// under-counts the real cost. Deliberately *not* derived by actually building
+// the bodies (wasteful when a draw might get rejected) or counting
+// `addPlatform`'s output after the fact (would mean checking the budget too
+// late) — this is the same cheap arithmetic both the quota check (handleDraw)
+// and the "ink left" readout (sendInkUpdate) share, so they can't drift apart.
+function segmentCount(points: Point[]): number {
+  return Math.max(0, points.length - 1);
 }
 
 // Chain of thin static rectangles, one per consecutive point pair — identical
@@ -318,6 +342,12 @@ export default class Server implements Party.Server {
     };
     conn.send(JSON.stringify(world_state));
 
+    // A fresh connection owns nothing yet (its id is brand new), so this is
+    // always a `{used: 0, max: MAX_SEGMENTS_PER_PLAYER}` baseline — sent now so
+    // the "ink left" UI has real numbers from the moment the player can draw,
+    // rather than showing a placeholder until their first stroke lands.
+    this.sendInkUpdate(conn);
+
     const body = Matter.Bodies.circle(WORLD_WIDTH / 2, WORLD_HEIGHT / 2 - 200, PLAYER_RADIUS, {
       label: "player",
       friction: 0.05,
@@ -386,6 +416,31 @@ export default class Server implements Party.Server {
     // anything else doesn't match a known shape — drop it silently
   }
 
+  // Sums the segment cost of every platform a connection owns — derived fresh
+  // from this.platforms each time, the same single-source-of-truth approach
+  // the erase feature's ownedCount used (see CLAUDE.md/TODO.md's "quota
+  // release" verification note: no separate counter to fall out of sync with
+  // what's actually in the world). Backs both the budget check in handleDraw
+  // and the "ink left" readout in sendInkUpdate.
+  private ownedSegments(ownerId: string): number {
+    let total = 0;
+    for (const platform of this.platforms.values()) {
+      if (platform.owner === ownerId) total += segmentCount(platform.points);
+    }
+    return total;
+  }
+
+  // Tells one connection how much of its segment "ink" budget it has left —
+  // sent right after world_state on join (so the UI has a real baseline before
+  // the player has drawn anything, rather than showing nothing/zero by default)
+  // and again after anything changes their usage: their own successful draws,
+  // and *any* erase of one of their platforms — including ones erased by other
+  // players, since this game's "anyone can erase anything" design (CLAUDE.md)
+  // means quota changes follow ownership, not who performed the action.
+  private sendInkUpdate(conn: Party.Connection) {
+    conn.send(JSON.stringify({ type: "ink", used: this.ownedSegments(conn.id), max: MAX_SEGMENTS_PER_PLAYER }));
+  }
+
   // Validates rate/cap limits (the GDD's "physics spam prevention"), creates
   // and persists the platform, then broadcasts it to every client — including
   // the drawer, so their own stroke becomes "real" via the same code path
@@ -395,8 +450,8 @@ export default class Server implements Party.Server {
     const last = this.lastDrawAt.get(sender.id) ?? 0;
     if (now - last < DRAW_COOLDOWN_MS) return;
 
-    const ownedCount = [...this.platforms.values()].filter((p) => p.owner === sender.id).length;
-    if (ownedCount >= MAX_PLATFORMS_PER_PLAYER) return;
+    const newSegments = segmentCount(data.points);
+    if (this.ownedSegments(sender.id) + newSegments > MAX_SEGMENTS_PER_PLAYER) return;
 
     this.lastDrawAt.set(sender.id, now);
 
@@ -406,6 +461,7 @@ export default class Server implements Party.Server {
     await this.room.storage.put(id, platformData);
 
     this.room.broadcast(JSON.stringify({ type: "platform_added", id, ...platformData }));
+    this.sendInkUpdate(sender);
   }
 
   // Removes a platform's bodies from the live world, drops it from the
@@ -431,6 +487,14 @@ export default class Server implements Party.Server {
     await this.room.storage.delete(data.id);
 
     this.room.broadcast(JSON.stringify({ type: "platform_removed", id: data.id }));
+
+    // Erasing frees up the *platform's owner's* segment budget — not the
+    // eraser's, since "anyone can erase anything" means those can be different
+    // connections. Tell the owner directly if they're still around; if they've
+    // since disconnected there's no live client to update (they'll get a fresh
+    // baseline reading via sendInkUpdate next time they join).
+    const owner = this.room.getConnection(platform.owner);
+    if (owner) this.sendInkUpdate(owner);
   }
 
   // Sanitizes and rate-limits a chat message, then broadcasts it to everyone —

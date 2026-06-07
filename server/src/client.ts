@@ -134,6 +134,7 @@ function asRecord(data: unknown): Record<string, unknown> | null {
 // stale client, a version-skewed deploy, a protocol typo — so it's logged
 // rather than silently dropped.
 const isString = (v: unknown): v is string => typeof v === "string";
+const isNumber = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 
 function warnUnexpectedShape(type: string, msg: Record<string, unknown>) {
   console.warn(`Ignoring "${type}" message from server — unexpected shape:`, msg);
@@ -280,6 +281,18 @@ function startGame(roomId: string, identity: Identity) {
   }
 
   window.addEventListener("mouseup", finishDrawing);
+
+  // "Ink" meter — a small live readout of how much of the player's segment
+  // budget remains, kept current by the server's `ink` messages (see the
+  // "ink" case in the message switch below, and sendInkUpdate server-side —
+  // the server is the sole source of truth for the number; this just displays
+  // it). Built here, alongside the rest of this connection's UI, rather than
+  // up with #palette at module load — its content is meaningless before a room
+  // connection exists, the same reasoning that placed the chat panel here too.
+  const inkMeter = document.createElement("div");
+  inkMeter.id = "ink-meter";
+  inkMeter.textContent = "Ink left: …"; // placeholder text until the server's baseline reading arrives (sent right after world_state on join — see onConnect)
+  document.body.appendChild(inkMeter);
 
   // Erasing — right-click a platform to remove it. Per this game's "shared
   // whiteboard" design, anyone can erase anything (see CLAUDE.md for the
@@ -485,6 +498,20 @@ function startGame(roomId: string, identity: Identity) {
       case "chat": {
         if (isString(msg.id) && isString(msg.username) && isString(msg.color) && isString(msg.text)) {
           appendChatEntry({ kind: "chat", username: msg.username, color: msg.color, text: msg.text });
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
+        break;
+      }
+      case "ink": {
+        // The server sends `used`/`max` (not `remaining`) because it's the one
+        // deriving `used` from this.platforms — `remaining = max - used` is
+        // pure display-layer arithmetic on values it already gave us directly,
+        // not a re-derivation of any server-side validation/business logic
+        // (the kind of duplication CLAUDE.md's client-validation note warns
+        // against), so computing it here is fine.
+        if (isNumber(msg.used) && isNumber(msg.max)) {
+          inkMeter.textContent = `Ink left: ${Math.max(0, msg.max - msg.used)} / ${msg.max}`;
         } else {
           warnUnexpectedShape(msg.type, msg);
         }
