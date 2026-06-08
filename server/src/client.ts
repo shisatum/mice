@@ -10,6 +10,7 @@ const WORLD_WIDTH = 1600;
 const WORLD_HEIGHT = 900;
 const GROUND_THICKNESS = 40;
 const PLAYER_RADIUS = 16;
+const CHEESE_RADIUS = 14; // px — mirrors the server's CHEESE_RADIUS; purely cosmetic here, since the cheese is a server-authoritative target point with no physics body for this client to derive geometry from
 const PLATFORM_THICKNESS = 10; // matches the server's PLATFORM_THICKNESS / the prototype's SEGMENT_THICKNESS
 const MIN_POINT_DISTANCE = 4; // px — minimum spacing between captured drawing points, matches the prototype
 const RDP_EPSILON = 2; // px — Ramer-Douglas-Peucker tolerance; the bandwidth optimization the prototype deferred (see CLAUDE.md)
@@ -111,6 +112,21 @@ const roster = new Map<string, Identity>();
 // keyed by id — the server is the only source of truth for what's "real";
 // rendering happens purely by regenerating geometry from each one's point array.
 const platforms = new Map<string, Platform>();
+
+// Minigame display state — populated *only* from server broadcasts, never
+// computed locally, mirroring latestPlayers/platforms's "server is sole
+// source of truth" posture. null means "nothing to show"; renderMinigameBanner
+// (built in startGame, alongside the rest of this connection's UI) is the one
+// place that turns these into what the player sees.
+let voteStatus: { proposedByUsername: string; yesCount: number; totalCount: number } | null = null;
+let raceStatus: { cheese: Point } | null = null;
+// The "setup latency" gap between a yes-vote and the race itself (see
+// minigame_countdown below and CLAUDE.md/the cheese-race plan's note on why
+// minigame_vote_resolved and minigame_started are kept as separate broadcasts).
+// `endsAt` is the server's absolute timestamp — frame() recomputes the seconds
+// remaining every frame from it (Date.now() drift-free, the same reasoning
+// behind the server modeling it as startedAt/endsAt rather than a duration).
+let countdownStatus: { endsAt: number } | null = null;
 
 // Right-click hit-testing: finds whichever *segment*, across every platform,
 // passes closest to `point` within ERASE_HIT_TOLERANCE — checking each
@@ -244,6 +260,13 @@ let erasing: Map<string, Set<number>> | null = null;
 
 let conn: PartySocket;
 
+// The large centered countdown readout — module-level (like `conn`) because
+// frame() (a free function, per this file's "render loop drives every visual
+// based on current state" shape) needs to update it every frame from
+// countdownStatus/Date.now(), but the element itself is built in startGame
+// alongside the rest of this connection's UI (see updateCountdownDisplay).
+let countdownEl: HTMLDivElement;
+
 // Opens the room connection and wires up everything that depends on it —
 // called once the join screen has collected the player's identity. Keeping
 // this deferred (rather than connecting at module load) is what lets the
@@ -310,6 +333,13 @@ function startGame(roomId: string, identity: Identity) {
     const p = canvasPoint(event);
     if (distance(drawing[drawing.length - 1], p) >= MIN_POINT_DISTANCE) {
       drawing.push(p);
+      // Cheese Race caps every stroke at exactly one segment (see the server's
+      // matching handleDraw check, and CLAUDE.md). The instant RDP would keep a
+      // third point — i.e. a corner just appeared, "a second segment wants to
+      // start" — cut the stroke short *right then*, not after release: waiting
+      // for mouseup to truncate would feel like a bait-and-switch (draw a long
+      // curve, release, watch it snap to a stub).
+      if (raceStatus && rdpSimplify(drawing, RDP_EPSILON).length > 2) finalizeRaceStroke();
     }
   });
 
@@ -324,11 +354,35 @@ function startGame(roomId: string, identity: Identity) {
     }
   }
 
+  // Sends the in-progress stroke as just its first segment, the moment a
+  // second one would have started. Sending only the first two simplified
+  // points is what "exactly one segment" means — mirrors finishDrawing's
+  // "null `drawing` first, then act on the captured path" ordering, so
+  // finishDrawing's existing `if (!drawing) return` already makes it a safe
+  // no-op on the eventual mouseup (no new "locked" state needed: drawing===null
+  // already means "not capturing," and mousedown unconditionally re-arms it).
+  function finalizeRaceStroke() {
+    if (!drawing) return;
+    const simplified = rdpSimplify(drawing, RDP_EPSILON);
+    drawing = null;
+    if (simplified.length >= 2) {
+      conn.send(JSON.stringify({ type: "draw", points: simplified.slice(0, 2), color: selectedColor }));
+    }
+  }
+
   // Records one hit-tested point into the in-progress erase-drag accumulator —
   // shared by the initial mousedown (so a plain right-click-without-dragging
   // still erases something) and every subsequent mousemove while dragging.
   function recordEraseHit(point: Point) {
     if (!erasing) return;
+    // Cheese Race caps a whole drag-gesture's worth of erasing to its first
+    // hit only (mirrors the server's matching handleErase truncation —
+    // CLAUDE.md). `erasing.size > 0` is the natural one-line proxy for "have
+    // we already recorded a hit this gesture," exactly aligned with the
+    // server's "first hit only" — no separate counter to keep in sync. The
+    // real cap is enforced server-side regardless; this just keeps the live
+    // preview from promising more than the server will honor.
+    if (raceStatus && erasing.size > 0) return;
     const hit = findSegmentAt(point);
     if (!hit) return;
     let segments = erasing.get(hit.platformId);
@@ -365,6 +419,45 @@ function startGame(roomId: string, identity: Identity) {
   inkMeter.id = "ink-meter";
   inkMeter.textContent = "Ink left: …"; // placeholder text until the server's baseline reading arrives (sent right after world_state on join — see onConnect)
   document.body.appendChild(inkMeter);
+
+  // Minigame status banner — top-center "informational chrome," following
+  // #ink-meter's exact recipe (muted color, pointer-events: none, text-shadow —
+  // see styles.css) but positioned to avoid colliding with #hint (top-left) or
+  // #ink-meter (bottom-center). Hidden whenever there's nothing to report;
+  // renderMinigameBanner is the single place that decides what it shows, kept
+  // in sync purely from voteStatus/raceStatus — both populated only by the
+  // minigame_* broadcast cases below, never computed locally.
+  const minigameBanner = document.createElement("div");
+  minigameBanner.id = "minigame-banner";
+  document.body.appendChild(minigameBanner);
+
+  // Large centered countdown — the "setup latency" beat between a yes-vote and
+  // the race itself (see countdownStatus/minigame_countdown). Deliberately a
+  // separate, much louder element from #minigame-banner: the user's spec asks
+  // for something "large...in the middle of the screen," which a small muted
+  // top-center line can't satisfy — this is the one piece of minigame chrome
+  // that's meant to grab attention rather than sit quietly out of the way.
+  // Hidden by default (no countdown is pending on join); updateCountdownDisplay
+  // is the single place — driven every frame, since its number is wall-clock-
+  // derived rather than event-derived — that decides what it shows.
+  countdownEl = document.createElement("div");
+  countdownEl.id = "minigame-countdown";
+  countdownEl.style.display = "none";
+  document.body.appendChild(countdownEl);
+
+  function renderMinigameBanner() {
+    if (raceStatus) {
+      minigameBanner.textContent = "Cheese Race! First to the cheese wins";
+      minigameBanner.style.display = "";
+    } else if (voteStatus) {
+      minigameBanner.textContent =
+        `${voteStatus.proposedByUsername} wants to play Cheese Race — ${voteStatus.yesCount}/${voteStatus.totalCount} ready (type /yes or /no)`;
+      minigameBanner.style.display = "";
+    } else {
+      minigameBanner.style.display = "none";
+    }
+  }
+  renderMinigameBanner();
 
   // Erasing — right-click-drag erases every segment the cursor crosses (see
   // `erasing`/recordEraseHit/finishErasing above, wired into mousedown/
@@ -453,6 +546,32 @@ function startGame(roomId: string, identity: Identity) {
     }
   }
 
+  // A small fixed vocabulary of typed commands, checked *before* anything is
+  // ever treated as chat — keeping "chat is chat" and "votes/proposals are
+  // typed messages" cleanly separate, mirroring how the server treats
+  // isValidChat/isValidMinigamePropose/isValidMinigameVote as independent
+  // shapes rather than one overloaded type with a hidden "is this secretly a
+  // command" branch. Recognized commands route to their own typed,
+  // server-validated messages and are *never* sent as `chat` text. An
+  // unrecognized `/word` becomes a **local-only** system note — so a typo
+  // doesn't land in the shared log as a literal "/rcae" for everyone to see.
+  function handleSlashCommand(text: string) {
+    const word = text.split(/\s+/)[0].toLowerCase();
+    switch (word) {
+      case "/race":
+        conn.send(JSON.stringify({ type: "minigame_propose", game: "cheese_race" }));
+        break;
+      case "/yes":
+        conn.send(JSON.stringify({ type: "minigame_vote", vote: true }));
+        break;
+      case "/no":
+        conn.send(JSON.stringify({ type: "minigame_vote", vote: false }));
+        break;
+      default:
+        appendChatEntry({ kind: "system", text: `Unknown command: ${word}` });
+    }
+  }
+
   chatInput.addEventListener("keydown", (event) => {
     // Stop here — the window-level handlers below (movement capture and the
     // closed-state "open chat" trigger) must never see keystrokes meant for
@@ -464,7 +583,10 @@ function startGame(roomId: string, identity: Identity) {
     if (event.key === "Enter") {
       event.preventDefault();
       const text = chatInput.value.trim();
-      if (text.length > 0) conn.send(JSON.stringify({ type: "chat", text }));
+      if (text.length > 0) {
+        if (text.startsWith("/")) handleSlashCommand(text);
+        else conn.send(JSON.stringify({ type: "chat", text }));
+      }
       setChatOpen(false);
     } else if (event.key === "Escape") {
       event.preventDefault();
@@ -600,6 +722,97 @@ function startGame(roomId: string, identity: Identity) {
         }
         break;
       }
+      case "minigame_vote_started": {
+        if (
+          isString(msg.game) &&
+          isString(msg.proposedBy) &&
+          isString(msg.proposedByUsername) &&
+          Array.isArray(msg.voterIds)
+        ) {
+          // yesCount starts at 0 — the server's very next broadcast is always
+          // minigame_vote_progress (sendVoteProgress fires right after
+          // minigame_vote_started in handleMinigamePropose, both over one
+          // ordered connection), which corrects this to reflect the proposer's
+          // auto-yes essentially instantly. Deriving "1" here from proposedBy
+          // would just be re-deriving server business logic a frame early.
+          voteStatus = { proposedByUsername: msg.proposedByUsername, yesCount: 0, totalCount: msg.voterIds.length };
+          renderMinigameBanner();
+          appendChatEntry({ kind: "system", text: `${msg.proposedByUsername} wants to play Cheese Race — type /yes or /no` });
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
+        break;
+      }
+      case "minigame_vote_progress": {
+        if (isNumber(msg.yesCount) && isNumber(msg.totalCount)) {
+          if (voteStatus) voteStatus = { ...voteStatus, yesCount: msg.yesCount, totalCount: msg.totalCount };
+          renderMinigameBanner();
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
+        break;
+      }
+      case "minigame_vote_resolved": {
+        const outcome = msg.outcome;
+        if (isString(msg.game) && (outcome === "started" || outcome === "cancelled")) {
+          voteStatus = null;
+          renderMinigameBanner();
+          if (outcome === "cancelled") {
+            const reason = msg.reason;
+            const text =
+              reason === "no_vote" && isString(msg.byUsername) ? `${msg.byUsername} doesn't want to race` :
+              reason === "timeout" ? "The vote to race timed out" :
+              reason === "left" ? "The vote to race was cancelled — not enough players" :
+              "The vote to race was cancelled";
+            appendChatEntry({ kind: "system", text });
+          }
+          // outcome === "started" needs no chat note of its own — minigame_countdown
+          // (broadcast immediately after, by the server's design — see CLAUDE.md/
+          // the plan's "kept distinct because... could diverge for a future
+          // minigame with setup latency," now realized exactly that way: the
+          // countdown *is* that setup latency) announces what's coming.
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
+        break;
+      }
+      case "minigame_countdown": {
+        if (isString(msg.game) && isNumber(msg.endsAt)) {
+          countdownStatus = { endsAt: msg.endsAt };
+          // Derived from the server's own endsAt rather than a client-side copy
+          // of MINIGAME_COUNTDOWN_MS — exactly the "trust the shape, not the
+          // fields, and don't re-derive server business logic" posture CLAUDE.md
+          // pins: the number this prints can never drift from what the server
+          // actually scheduled, even if that constant changes on the server side.
+          const seconds = Math.max(0, Math.round((msg.endsAt - Date.now()) / 1000));
+          appendChatEntry({ kind: "system", text: `Cheese Race starting in ${seconds} — get ready!` });
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
+        break;
+      }
+      case "minigame_started": {
+        const cheese = asRecord(msg.cheese);
+        if (isString(msg.game) && cheese && isNumber(cheese.x) && isNumber(cheese.y)) {
+          countdownStatus = null;
+          raceStatus = { cheese: { x: cheese.x, y: cheese.y } };
+          renderMinigameBanner();
+          appendChatEntry({ kind: "system", text: "Cheese Race! First to the cheese wins" });
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
+        break;
+      }
+      case "minigame_ended": {
+        if (isString(msg.winnerId) && isString(msg.winnerUsername)) {
+          raceStatus = null;
+          renderMinigameBanner();
+          appendChatEntry({ kind: "system", text: `${msg.winnerUsername} won the Cheese Race!` });
+        } else {
+          warnUnexpectedShape(msg.type, msg);
+        }
+        break;
+      }
       default:
         console.warn("Ignoring message from server with unrecognized type:", msg.type);
     }
@@ -669,6 +882,41 @@ function drawErasePreview() {
   }
 }
 
+// Cheese render — mirrors drawPlatforms/drawPlayers's shape: a filled circle
+// in PALETTE_COLORS[2] ("#ffd479" — already the palette's "cheese yellow," no
+// new color to invent), dark outline matching the avatar stroke style. The
+// cheese is a server-authoritative *target point*, never a physics body —
+// raceStatus is populated only by minigame_started and cleared only by
+// minigame_ended, so this purely renders what the server already decided.
+function drawCheese() {
+  if (!raceStatus) return;
+  const { cheese } = raceStatus;
+  ctx.beginPath();
+  ctx.arc(cheese.x, cheese.y, CHEESE_RADIUS, 0, Math.PI * 2);
+  ctx.fillStyle = PALETTE_COLORS[2];
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#1b1d23";
+  ctx.stroke();
+}
+
+// The countdown's number is wall-clock-derived (ticks every frame from
+// countdownStatus.endsAt and Date.now()), not event-derived like every other
+// piece of minigame chrome — so unlike renderMinigameBanner (called only when
+// voteStatus/raceStatus actually change), this runs from frame() every frame,
+// the one place that already recomputes everything from "now." Recomputing
+// from the absolute endsAt each time (rather than counting down a local
+// duration) is what keeps it immune to drift or a missed frame.
+function updateCountdownDisplay() {
+  if (!countdownStatus) {
+    countdownEl.style.display = "none";
+    return;
+  }
+  const secondsLeft = Math.max(0, Math.ceil((countdownStatus.endsAt - Date.now()) / 1000));
+  countdownEl.textContent = String(secondsLeft);
+  countdownEl.style.display = "";
+}
+
 function drawPlayers() {
   for (const player of latestPlayers) {
     const isMe = player.id === conn.id;
@@ -696,8 +944,10 @@ function frame() {
   drawGround();
   drawErasePreview();
   drawPlatforms();
+  drawCheese();
   drawPlayers();
   drawInProgressPath();
+  updateCountdownDisplay();
   requestAnimationFrame(frame);
 }
 

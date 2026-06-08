@@ -46,6 +46,45 @@ const MAX_ERASE_HITS = 500; // generous cap on one batched erase message's segme
 // crossing several overlapping platforms) land nowhere near this; it only stops egregious abuse
 const MAX_CHAT_LENGTH = 240; // generous for a quick line of chat — comfortably under anything that'd overwhelm the log; enforced here AND as the client's <input maxlength>, but this copy is the one that actually matters
 const CHAT_COOLDOWN_MS = 400; // per-connection rate limit, per the GDD's "Rate Limiting" guidance — looser than DRAW_COOLDOWN_MS (chat never touches physics) but tight enough to block flooding; the same "spam guard, not a gameplay gate" posture ERASE_COOLDOWN_MS established
+
+// Minigame: vote-to-start infrastructure + "Cheese Race" (the first minigame).
+// Floor of 1 (not 2+) is deliberate: it makes a solo race a *formality*, not a
+// special case — the proposer's auto-yes (see handleMinigamePropose) already
+// satisfies "everyone agreed" the instant `voters` is just `{proposer}`, so
+// `pending` starts empty and the vote resolves immediately via the same
+// tryResolveVote() a multiplayer vote uses. One mouse alone in a room can walk
+// to the cheese and "win" — harmless (nothing to grief, nothing to balance),
+// and handy for trying the mode out without recruiting a second player. A vote
+// that nobody resolves still shouldn't hang forever — checked in step() (the
+// room's only periodic gameplay loop; see its comment on why a one-shot
+// setTimeout would be the wrong tool here).
+const MIN_PLAYERS_FOR_MINIGAME = 1;
+const VOTE_TIMEOUT_MS = 60_000;
+// The pause between "the vote resolved to yes" and "the cheese actually
+// appears" — long enough to be a real beat (find a vantage point, stop
+// mid-conversation) without dragging; ten seconds is the user's own spec, not
+// a tuned value. Modeled as an absolute `endsAt` timestamp (Date.now() + this),
+// mirroring startedAt/VOTE_TIMEOUT_MS — checked once per tick in step(), the
+// same "reuse the room's only periodic loop, no setTimeout bookkeeping" reasoning
+// that governs the vote timeout right above it.
+const MINIGAME_COUNTDOWN_MS = 10_000;
+// Race-mode draw/erase get their own cooldown identities — RACE_DRAW_COOLDOWN_MS
+// happens to equal DRAW_COOLDOWN_MS today, but naming it separately makes "race
+// mode has its own rules" grep-able and free to diverge later without implying
+// the equality was ever meant to be permanent. RACE_ERASE_COOLDOWN_MS is
+// deliberately *slower* than ERASE_COOLDOWN_MS=250 — the user explicitly wants
+// erasing to feel more deliberate (and costly) during a race than in free play.
+const RACE_DRAW_COOLDOWN_MS = 1000;
+const RACE_ERASE_COOLDOWN_MS = 1000;
+const CHEESE_RADIUS = 14; // px — smaller than PLAYER_RADIUS so it reads as "a thing to find," not "another avatar"
+const CHEESE_PICKUP_DISTANCE = PLAYER_RADIUS + CHEESE_RADIUS; // two circles "touch" exactly at the sum of their radii
+// Generalizes the empirically-verified "avatar rests on a platform surface"
+// resting-height math from Phase 6 (a body settles with its center one radius
+// above the surface, and the surface itself is centered on its point array, so
+// it sits PLATFORM_THICKNESS/2 further out again) — used to place the cheese
+// visually *on* a platform's surface rather than centered on its (invisible)
+// physics centerline.
+const CHEESE_SURFACE_OFFSET = PLAYER_RADIUS + CHEESE_RADIUS + PLATFORM_THICKNESS / 2;
 const MAX_ACTIVITY_LOG = 50; // rolling join/leave/chat history replayed to new joiners via world_state — a "what did I miss" catch-up, not a permanent record, so it stays well under the client's MAX_CHAT_LOG=200 *display* cap; in-memory only (mirrors chat's existing "live conversation, no restore-on-restart expectation")
 const DIRECTORY_PING_INTERVAL_MS = 30_000; // periodic safety-net re-registration with the directory party (see directory.ts) — onConnect/onClose already ping on every player-count change, but a long-lived room with no joins/leaves would otherwise never refresh its lastSeen and could be filtered out as stale (directory.ts's STALE_AFTER_MS=90_000 is 3x this, tolerating a couple of missed beats)
 const COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
@@ -171,6 +210,25 @@ function isValidChat(data: unknown): data is { type: "chat"; text: string } {
   return type === "chat" && typeof text === "string";
 }
 
+// `game` is checked against the one known literal — same "right type, right
+// value" posture isValidInput takes toward Keys's booleans. A client proposing
+// an unknown game is either stale or buggy; isValidMinigamePropose's job is
+// only to confirm the *shape* is trustworthy enough to hand to handleMinigamePropose,
+// which then applies the real "is a vote even possible right now" gameplay checks.
+function isValidMinigamePropose(data: unknown): data is { type: "minigame_propose"; game: MinigameId } {
+  if (typeof data !== "object" || data === null) return false;
+  const { type, game } = data as Record<string, unknown>;
+  return type === "minigame_propose" && game === "cheese_race";
+}
+
+// A plain boolean — mirroring Keys's booleans — not a "yes"|"no" string enum;
+// "did you vote yes" is a single bit, and a bool is the smallest honest shape for it.
+function isValidMinigameVote(data: unknown): data is { type: "minigame_vote"; vote: boolean } {
+  if (typeof data !== "object" || data === null) return false;
+  const { type, vote } = data as Record<string, unknown>;
+  return type === "minigame_vote" && typeof vote === "boolean";
+}
+
 // Upper-bound estimate of how many physics bodies a point array will produce —
 // createPlatformBodies emits one rectangle per consecutive point pair, skipping
 // only true degenerate (sub-half-pixel) ones, so points.length-1 never
@@ -246,6 +304,49 @@ type PlayerState = {
 
 type ConnState = { username: string; color: string };
 
+// One-member literal union *now* — deliberately typed this way (not bare
+// `string`) so a future second minigame ("Last Mouse Standing" — see TODO.md)
+// becomes a type-checked addition to exactly one place: widen this union and
+// the compiler finds every switch that needs a new arm.
+type MinigameId = "cheese_race";
+
+// Snapshot of an in-flight "should we play a minigame?" vote. `voters` is the
+// full eligible set, captured at proposal time (so later joiners can't join or
+// block an in-progress vote — they're spectators for it); `pending` starts as
+// `voters` minus the proposer (whose vote auto-counts as yes, the user's chosen
+// design) and shrinks to empty on unanimous agreement.
+type PendingVote = {
+  game: MinigameId;
+  proposedBy: string; // connection id — attribution only, never security-relevant
+  proposedByUsername: string;
+  voters: Set<string>;
+  pending: Set<string>;
+  startedAt: number; // checked against VOTE_TIMEOUT_MS in step()
+};
+
+// The gap between a vote resolving "yes" and the race actually starting — see
+// MINIGAME_COUNTDOWN_MS. `endsAt` is an absolute timestamp (mirrors PendingVote's
+// startedAt/VOTE_TIMEOUT_MS pairing), checked once per tick in step(). Kept as
+// its own null-when-idle field — distinct from both PendingVote (the vote is
+// long since resolved and gone) and CheeseRaceState (no cheese exists yet, so
+// none of activeMinigame's race-mode machinery — draw/erase caps, win-check —
+// should be live) — for exactly the "could diverge for a future minigame with
+// setup latency" reason client.ts's minigame_vote_resolved handler already notes.
+type PendingCountdown = {
+  game: MinigameId;
+  endsAt: number;
+};
+
+// Live state for an active Cheese Race. `cheese` is server-authoritative —
+// computed once at start and broadcast, never recomputed or trusted from a
+// client — and is purely a target point for the win-check; it has no physics
+// body and never collides (see pickCheeseSpawn's comment on bounds-clamping).
+type CheeseRaceState = {
+  game: "cheese_race";
+  cheese: Point;
+  startedAt: number;
+};
+
 // A line in the rolling join/leave/chat history replayed to new joiners (see
 // activityLog/logActivity and world_state below). Join/leave carry structured
 // {kind, username} rather than pre-formatted text — display wording ("X joined")
@@ -265,6 +366,15 @@ export default class Server implements Party.Server {
   lastChatAt = new Map<string, number>(); // connection id -> ms timestamp, for rate limiting
   activityLog: ActivityEntry[] = []; // rolling join/leave/chat history, capped at MAX_ACTIVITY_LOG — see logActivity
   tick = 0;
+
+  // Ephemeral live-session state, like activityLog/tick — null-when-idle,
+  // mirroring the drawing/erasing convention. Deliberately NOT persisted to
+  // room.storage: a vote or race that was mid-flight when the room restarted
+  // should simply not exist anymore, the same way an in-progress mouse drag
+  // wouldn't survive a reload.
+  pendingVote: PendingVote | null = null;
+  pendingCountdown: PendingCountdown | null = null; // the "setup latency" gap between a yes-vote and the race itself — see PendingCountdown
+  activeMinigame: CheeseRaceState | null = null; // named generically — a future second minigame widens the union, not this field
 
   constructor(readonly room: Party.Room) {}
 
@@ -500,6 +610,34 @@ export default class Server implements Party.Server {
     this.lastEraseAt.delete(conn.id);
     this.lastChatAt.delete(conn.id);
     this.logActivity({ kind: "leave", username: state.username });
+
+    // Mid-vote disconnect: a leaving voter can no longer be waited on. If the
+    // pool that started the vote drops below the minimum needed for "everyone"
+    // to mean anything (which also catches the proposer themselves leaving —
+    // size can only shrink here), the vote can no longer resolve meaningfully,
+    // so cancel it outright. Otherwise route the departure through
+    // tryResolveVote — removing them from `pending` might *itself* complete
+    // the vote, the same path a live "yes" takes, keeping "what makes a vote
+    // resolve" defined in exactly one place. No special mid-race handling is
+    // needed: the win-check in step() only ever iterates this.players, which
+    // conn.id has *already* been removed from by the time this runs.
+    if (this.pendingVote && this.pendingVote.voters.has(conn.id)) {
+      const vote = this.pendingVote;
+      vote.voters.delete(conn.id);
+      vote.pending.delete(conn.id);
+      if (vote.voters.size < MIN_PLAYERS_FOR_MINIGAME) {
+        this.pendingVote = null;
+        this.room.broadcast(JSON.stringify({
+          type: "minigame_vote_resolved",
+          game: vote.game,
+          outcome: "cancelled",
+          reason: "left",
+        }));
+      } else {
+        this.tryResolveVote();
+      }
+    }
+
     this.pingDirectory(); // player count just changed (possibly to zero — pingDirectory reports this.players.size, and the directory drops a room on a 0 count) — let the directory know either way
     this.room.broadcast(JSON.stringify({ type: "player_left", id: conn.id }));
   }
@@ -530,6 +668,16 @@ export default class Server implements Party.Server {
 
     if (isValidChat(data)) {
       this.handleChat(data, sender);
+      return;
+    }
+
+    if (isValidMinigamePropose(data)) {
+      this.handleMinigamePropose(data, sender);
+      return;
+    }
+
+    if (isValidMinigameVote(data)) {
+      this.handleMinigameVote(data, sender);
       return;
     }
 
@@ -567,7 +715,18 @@ export default class Server implements Party.Server {
   private async handleDraw(data: { points: Point[]; color: string }, sender: Party.Connection) {
     const now = Date.now();
     const last = this.lastDrawAt.get(sender.id) ?? 0;
-    if (now - last < DRAW_COOLDOWN_MS) return;
+    const cooldown = this.activeMinigame ? RACE_DRAW_COOLDOWN_MS : DRAW_COOLDOWN_MS;
+    if (now - last < cooldown) return;
+
+    // Cheese Race additionally caps every stroke at exactly one segment — the
+    // user's explicit design to keep races tense. This is a race-specific
+    // *extra* check layered on top of isValidDraw's general shape validation
+    // (already run before handleDraw is ever called — it guarantees
+    // points.length >= 2), not a parallel reimplementation of it: "exactly one
+    // segment" reads cleanly as "exactly two points." Movement is deliberately
+    // left unconstrained in race mode — the user only asked to limit
+    // drawing/erasing, not running/jumping.
+    if (this.activeMinigame && data.points.length !== 2) return;
 
     const newSegments = segmentCount(data.points);
     if (this.totalSegments() + newSegments > MAX_SEGMENTS_PER_ROOM) return;
@@ -606,13 +765,24 @@ export default class Server implements Party.Server {
   private async handleErase(data: { hits: { platformId: string; segmentIndex: number }[] }, sender: Party.Connection) {
     const now = Date.now();
     const last = this.lastEraseAt.get(sender.id) ?? 0;
-    if (now - last < ERASE_COOLDOWN_MS) return;
+    const cooldown = this.activeMinigame ? RACE_ERASE_COOLDOWN_MS : ERASE_COOLDOWN_MS;
+    if (now - last < cooldown) return;
+
+    // Cheese Race additionally caps a whole drag-gesture's worth of erasing to
+    // its first hit only — truncating *before* the per-platform grouping below
+    // is the simplest possible mechanism: the entire downstream
+    // grouping/splitting/broadcast logic stays untouched and naturally only
+    // ever sees one hit, so nothing inside it can drift from how grouping
+    // actually works. `hits[0]` is also unambiguous in a way "first group from
+    // a Map" wouldn't be when a drag spans multiple platforms (Map iteration
+    // order ≠ drag order). Movement is deliberately left unconstrained.
+    const hits = this.activeMinigame ? data.hits.slice(0, 1) : data.hits;
 
     // Group hits by platform, deduping segment indices — a drag can cross the
     // same segment more than once (e.g. doubling back), and splitPoints wants
     // a Set of indices, not a list with repeats.
     const hitsByPlatform = new Map<string, Set<number>>();
-    for (const hit of data.hits) {
+    for (const hit of hits) {
       let segments = hitsByPlatform.get(hit.platformId);
       if (!segments) hitsByPlatform.set(hit.platformId, (segments = new Set()));
       segments.add(hit.segmentIndex);
@@ -682,6 +852,167 @@ export default class Server implements Party.Server {
     );
   }
 
+  // Picks a uniformly random vertex of a uniformly random existing platform —
+  // the exact Math.floor(Math.random() * arr.length) idiom pickUsername/
+  // generateRoomCode already use, applied twice. RDP-simplified strokes already
+  // have vertices every few dozen pixels, so "a random vertex of a random
+  // platform" reads as "a random point on the drawing" without inventing
+  // segment-interpolation math this codebase has zero precedent for.
+  //
+  // Falls back to a fixed point on the ground when the room has no platforms
+  // yet, guaranteeing a race can always start with a reachable cheese — no
+  // special-casing anywhere downstream. CHEESE_SURFACE_OFFSET places the
+  // cheese's *center* exactly where a standing player's center would be —
+  // PLATFORM_THICKNESS/2 (centerline → surface) + PLAYER_RADIUS (surface →
+  // resting center) — plus CHEESE_RADIUS, so a player standing at that spot is
+  // already exactly CHEESE_PICKUP_DISTANCE away: touching, by construction.
+  //
+  // Deliberately doesn't bounds-clamp the result: the cheese is a server-
+  // computed cosmetic target, never a physics body that could leave the world —
+  // isValidPoint's bounds-checking is a *validation* concern for untrusted
+  // player-submitted data, not a constraint on server-drawn circles.
+  private pickCheeseSpawn(): Point {
+    if (this.platforms.size === 0) {
+      return { x: WORLD_WIDTH / 2, y: WORLD_HEIGHT - GROUND_THICKNESS - CHEESE_SURFACE_OFFSET };
+    }
+    const platformList = [...this.platforms.values()];
+    const platform = platformList[Math.floor(Math.random() * platformList.length)];
+    const vertex = platform.points[Math.floor(Math.random() * platform.points.length)];
+    return { x: vertex.x, y: vertex.y - CHEESE_SURFACE_OFFSET };
+  }
+
+  // Single source of truth for "how is the current vote going" — broadcast
+  // after every event that changes the tally (including the moment a fresh
+  // proposal lands, since the proposer's auto-yes is itself a data point) so
+  // every client's "N/M ready" readout can never drift from the server's.
+  // Deliberately omits *who* voted yes — the smallest payload that satisfies
+  // the "show progress" ask; minigame_vote_started already named the proposer.
+  private sendVoteProgress() {
+    const vote = this.pendingVote;
+    if (!vote) return;
+    this.room.broadcast(JSON.stringify({
+      type: "minigame_vote_progress",
+      yesCount: vote.voters.size - vote.pending.size,
+      totalCount: vote.voters.size,
+    }));
+  }
+
+  // Silently drops if a vote or race is already underway, or there aren't
+  // enough players for "everyone agrees" to mean anything — the same "drop
+  // invalid input silently" posture every other gameplay gate in this room
+  // takes. `voters` snapshots the eligible set at proposal time (so later
+  // joiners can't join *or* block a vote already in flight — they're
+  // spectators for it, exactly like a snapshot taken mid-vote). Per the user's
+  // chosen design, the proposer's own vote auto-counts as yes — `pending`
+  // starts as `voters` minus the proposer, so e.g. a 3-player race only needs
+  // the *other* 2 to confirm.
+  private handleMinigamePropose(data: { game: MinigameId }, sender: Party.Connection) {
+    if (this.pendingVote || this.activeMinigame) return;
+    if (this.players.size < MIN_PLAYERS_FOR_MINIGAME) return;
+
+    const state = this.players.get(sender.id);
+    if (!state) return; // shouldn't happen on a live connection — guards a theoretical onMessage/onClose race, mirroring handleChat
+
+    const voters = new Set(this.players.keys());
+    const pending = new Set(voters);
+    pending.delete(sender.id);
+
+    this.pendingVote = {
+      game: data.game,
+      proposedBy: sender.id,
+      proposedByUsername: state.username,
+      voters,
+      pending,
+      startedAt: Date.now(),
+    };
+
+    this.room.broadcast(JSON.stringify({
+      type: "minigame_vote_started",
+      game: data.game,
+      proposedBy: sender.id,
+      proposedByUsername: state.username,
+      voterIds: [...voters],
+    }));
+    // Routes through the shared resolver rather than calling sendVoteProgress
+    // directly — not just for consistency, but because `pending` can *already*
+    // be empty here (a solo proposer: voters = {proposer}, pending = {}).
+    // tryResolveVote is the one place that knows what an empty `pending` means
+    // (resolve to "started" right now); calling sendVoteProgress unconditionally
+    // would broadcast a "1/1 ready" that nothing ever follows up on, leaving the
+    // vote stuck until VOTE_TIMEOUT_MS silently cancels it.
+    this.tryResolveVote();
+  }
+
+  // No-op if there's no vote in flight, or the sender wasn't part of the
+  // eligible set captured when it started — late joiners are spectators for a
+  // vote already underway, the same way a mid-drag drawer can't be interrupted
+  // by someone who joined after the stroke began. A `false` vote is a veto —
+  // by the user's design this is "does *everyone* want to play," not a
+  // majority count, so a single "no" cancels immediately. A `true` vote clears
+  // the sender from `pending`; reaching empty is what tryResolveVote checks for —
+  // the one shared place "what makes a vote resolve" is decided.
+  private handleMinigameVote(data: { vote: boolean }, sender: Party.Connection) {
+    const vote = this.pendingVote;
+    if (!vote || !vote.voters.has(sender.id)) return;
+
+    const state = this.players.get(sender.id);
+    if (!state) return; // shouldn't happen on a live connection — guards a theoretical onMessage/onClose race, mirroring handleChat
+
+    if (!data.vote) {
+      this.pendingVote = null;
+      this.room.broadcast(JSON.stringify({
+        type: "minigame_vote_resolved",
+        game: vote.game,
+        outcome: "cancelled",
+        reason: "no_vote",
+        byUsername: state.username,
+      }));
+      return;
+    }
+
+    vote.pending.delete(sender.id);
+    this.tryResolveVote();
+  }
+
+  // The one place "what makes a vote resolve" is decided — called both from a
+  // fresh "yes" landing (handleMinigameVote) and from onClose's mid-vote-
+  // disconnect branch (a pending voter leaving might *itself* complete the
+  // vote), so the two paths can never diverge on what counts as "everyone
+  // agreed." Resolving to "started" clears the vote *before* kicking off the
+  // race, mirroring handleDraw's "set state, then act on it" ordering.
+  private tryResolveVote() {
+    const vote = this.pendingVote;
+    if (!vote) return;
+
+    if (vote.pending.size > 0) {
+      this.sendVoteProgress();
+      return;
+    }
+
+    this.pendingVote = null;
+    this.room.broadcast(JSON.stringify({ type: "minigame_vote_resolved", game: vote.game, outcome: "started" }));
+    this.startCountdown(vote.game);
+  }
+
+  // Interposed between "the vote resolved to yes" (minigame_vote_resolved) and
+  // "the race actually begins" (minigame_started) — exactly the "setup latency"
+  // gap that broadcast's own design comment anticipated. Deliberately does NOT
+  // touch activeMinigame or call startCheeseRace yet: the cheese must not exist
+  // — and none of the race-mode machinery that keys off activeMinigame (the
+  // draw/erase segment caps, the win-check) should be live — until the
+  // countdown actually expires in step().
+  private startCountdown(game: MinigameId) {
+    const endsAt = Date.now() + MINIGAME_COUNTDOWN_MS;
+    this.pendingCountdown = { game, endsAt };
+    this.room.broadcast(JSON.stringify({ type: "minigame_countdown", game, endsAt }));
+  }
+
+  private startCheeseRace() {
+    const cheese = this.pickCheeseSpawn();
+    this.activeMinigame = { game: "cheese_race", cheese, startedAt: Date.now() };
+    this.room.broadcast(JSON.stringify({ type: "minigame_started", game: "cheese_race", cheese }));
+  }
+
   // Direct-velocity movement and a one-shot, ground-gated jump — identical
   // logic to the prototype's updatePlayer(), now driven by network input
   // instead of local keyboard state.
@@ -700,10 +1031,65 @@ export default class Server implements Party.Server {
   }
 
   step() {
+    // Vote timeout — checked here, on the room's only periodic gameplay loop,
+    // rather than via a one-shot setTimeout: this room's only timers
+    // (onStart's two setIntervals) are periodic infrastructure, never
+    // one-shot gameplay timers that would need cancel-on-early-resolution
+    // bookkeeping. Reusing the existing 20Hz tick sidesteps that whole class
+    // of problem — a vote that resolves early just never reaches this check
+    // again, because pendingVote is already null.
+    if (this.pendingVote && Date.now() - this.pendingVote.startedAt > VOTE_TIMEOUT_MS) {
+      const vote = this.pendingVote;
+      this.pendingVote = null;
+      this.room.broadcast(JSON.stringify({
+        type: "minigame_vote_resolved",
+        game: vote.game,
+        outcome: "cancelled",
+        reason: "timeout",
+      }));
+    }
+
+    // Countdown expiry — same absolute-timestamp/tick-checked shape as the vote
+    // timeout right above (and for the same reason: this is the room's only
+    // periodic gameplay loop, so a one-shot setTimeout would just be redundant
+    // cancel-on-early-resolution bookkeeping this state never needs — nothing
+    // can resolve a countdown early). Only once it fires does the cheese exist
+    // and race-mode rules switch on, per the user's explicit "don't place cheese
+    // until after countdown ends" spec.
+    if (this.pendingCountdown && Date.now() >= this.pendingCountdown.endsAt) {
+      this.pendingCountdown = null;
+      this.startCheeseRace();
+    }
+
     for (const state of this.players.values()) this.applyInput(state);
 
     for (let i = 0; i < SUB_STEPS; i++) {
       Matter.Engine.update(this.engine, SUB_STEP_MS);
+    }
+
+    // Win-check — right after physics settles this tick (checking against
+    // *settled* positions, not last tick's, is the more intuitive read) and
+    // before the snapshot is built, so a winning touch and the snapshot that
+    // shows it land in the same broadcast wave.
+    if (this.activeMinigame) {
+      const { cheese } = this.activeMinigame;
+      for (const [id, state] of this.players) {
+        const dist = Math.hypot(state.body.position.x - cheese.x, state.body.position.y - cheese.y);
+        if (dist <= CHEESE_PICKUP_DISTANCE) {
+          this.activeMinigame = null;
+          this.room.broadcast(JSON.stringify({
+            type: "minigame_ended",
+            game: "cheese_race",
+            winnerId: id,
+            winnerUsername: state.username,
+          }));
+          break; // first toucher in Map-iteration (= arrival) order wins — an
+                 // arbitrary but consistent tiebreak for the vanishingly-unlikely
+                 // same-tick double touch; the spec never asks for a fairer one,
+                 // so don't invent one (the same restraint splitPoints/findSegmentAt
+                 // showed when picking "closest" over "topmost" for hit-testing)
+        }
+      }
     }
 
     const players = [...this.players.entries()].map(([id, { body }]) => ({

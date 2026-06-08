@@ -46,6 +46,49 @@ canvas {
   pointer-events: none;
 }
 
+/* Top-center "informational chrome," following #ink-meter's exact recipe
+   (muted color, pointer-events: none, text-shadow) but positioned to stay
+   clear of #ink-meter (bottom-center). #hint shares this same top edge
+   (top: 8px) and, being a single wide unwrapped line pinned to the left, can
+   reach all the way to center screen — so this banner sits a full line *below*
+   it instead of beside it: #hint's box runs from top:8px to roughly
+   8 + 13*1.4 ≈ 26px (its font's line-height), and top:36px clears that with a
+   clean ~10px gap, the same breathing room #ink-meter leaves above #palette.
+   Hidden via inline style.display when there's no vote/race to report; see
+   renderMinigameBanner in client.ts for the one place that decides that. */
+#minigame-banner {
+  position: fixed;
+  top: 36px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #9aa0ad;
+  font: 12px/1.4 system-ui, sans-serif;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
+
+/* The "large...in the middle of the screen" countdown the user explicitly
+   asked for — deliberately the loudest piece of minigame chrome (vs.
+   #minigame-banner/#ink-meter's quiet muted-text recipe), since its whole job
+   is to grab attention for the ten-second beat between a yes-vote and the
+   race actually starting. `inset: 0` + flex centering spans and centers on the
+   full viewport regardless of size; pointer-events: none so it never blocks
+   the canvas beneath it (matching every other piece of HUD chrome here).
+   Hidden via inline style.display by updateCountdownDisplay in client.ts —
+   the one place that decides whether/what it shows, ticking every frame off
+   countdownStatus.endsAt. */
+#minigame-countdown {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 700 140px/1 system-ui, sans-serif;
+  color: #f4f6fb;
+  text-shadow: 0 6px 28px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+}
+
 .swatch {
   width: 28px;
   height: 28px;
