@@ -14,6 +14,7 @@ const PLATFORM_THICKNESS = 10; // matches the server's PLATFORM_THICKNESS / the 
 const MIN_POINT_DISTANCE = 4; // px — minimum spacing between captured drawing points, matches the prototype
 const RDP_EPSILON = 2; // px — Ramer-Douglas-Peucker tolerance; the bandwidth optimization the prototype deferred (see CLAUDE.md)
 const ERASE_HIT_TOLERANCE = PLATFORM_THICKNESS / 2 + 6; // px — how close a right-click must land to a platform's stroke to erase it; a little forgiveness beyond the visual half-thickness so thin/precise strokes stay easy to target
+const ERASE_PREVIEW_COLOR = "#ff6b6b"; // a "danger" red, deliberately outside PALETTE_COLORS' pastel set (and distinct from the "(you)" green) — communicates "about to be removed," not "an avatar/platform color choice"
 const MAX_CHAT_LENGTH = 240; // mirrors the server's MAX_CHAT_LENGTH — caps the <input> so nothing gets typed that the server would just truncate anyway
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
@@ -616,6 +617,33 @@ function drawInProgressPath() {
   if (drawing) drawPlatformPath(drawing, selectedColor);
 }
 
+// Live preview of an in-progress erase drag — re-strokes each segment
+// `erasing` has accumulated so far (see its declaration) in a wider, danger-
+// colored line *underneath* the platform's own stroke (drawn after this, in
+// `frame`), producing a glow around exactly what mouse-up will remove. Purely
+// cosmetic and ephemeral: nothing is actually gone until the server broadcasts
+// `platform_removed`/`platform_added`, mirroring `drawInProgressPath`'s "local
+// preview, server has final say" posture for drawing.
+function drawErasePreview() {
+  if (!erasing) return;
+  for (const [platformId, segments] of erasing) {
+    const platform = platforms.get(platformId);
+    if (!platform) continue;
+    for (const index of segments) {
+      const start = platform.points[index];
+      const end = platform.points[index + 1];
+      if (!start || !end) continue;
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.lineCap = "round";
+      ctx.strokeStyle = ERASE_PREVIEW_COLOR;
+      ctx.lineWidth = PLATFORM_THICKNESS + 6;
+      ctx.stroke();
+    }
+  }
+}
+
 function drawPlayers() {
   for (const player of latestPlayers) {
     const isMe = player.id === conn.id;
@@ -641,6 +669,7 @@ function drawPlayers() {
 function frame() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawGround();
+  drawErasePreview();
   drawPlatforms();
   drawPlayers();
   drawInProgressPath();
