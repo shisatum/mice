@@ -18,6 +18,19 @@ const ERASE_HIT_TOLERANCE = PLATFORM_THICKNESS / 2 + 6; // px — how close a ri
 const ERASE_PREVIEW_COLOR = "#ff6b6b"; // a "danger" red, deliberately outside PALETTE_COLORS' pastel set (and distinct from the "(you)" green) — communicates "about to be removed," not "an avatar/platform color choice"
 const MAX_CHAT_LENGTH = 240; // mirrors the server's MAX_CHAT_LENGTH — caps the <input> so nothing gets typed that the server would just truncate anyway
 
+// Mirrors the server's TICK_MS — the interval between position snapshots.
+// Kept as its own client-side copy for the same reason WORLD_WIDTH et al. are:
+// this is a separate (browser) bundle that can't import the backend module.
+// MUST stay in sync with server/src/server.ts's TICK_MS.
+const SERVER_TICK_MS = 50;
+
+// How far in the past to render, for entity interpolation. Two snapshot
+// intervals: one is the minimum (so there's normally a newer snapshot to tween
+// toward), the second is jitter/late-packet margin (one delayed or dropped
+// snapshot still leaves a bracket to interpolate within). Larger = smoother
+// under bad networks but more input latency on the local avatar.
+const INTERP_DELAY_MS = SERVER_TICK_MS * 2;
+
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 canvas.width = WORLD_WIDTH;
 canvas.height = WORLD_HEIGHT;
@@ -100,12 +113,19 @@ function joinLeaveText(kind: "join" | "leave", username: string): string {
 
 const DEFAULT_AVATAR_COLOR = "#f4c95d"; // matches the server's DEFAULT_AVATAR_COLOR fallback
 
-let latestPlayers: PlayerSnapshot[] = [];
+type Snapshot = { receivedAt: number; players: PlayerSnapshot[] };
+
+// Recent position snapshots, oldest-first, for entity interpolation. The render
+// loop (frame -> playersAt) draws a blend of the two snapshots bracketing
+// "now - INTERP_DELAY_MS" rather than the newest one outright, so 20Hz server
+// updates render smoothly at display rate. Pruned to just the window the current
+// render needs (see the snapshot case below).
+let snapshotBuffer: Snapshot[] = [];
 
 // Identities (username + chosen avatar color) arrive separately from position
 // snapshots (world_state on join, player_joined/player_left as the roster
 // changes) — keyed by connection id so they can be looked up while rendering
-// each avatar from latestPlayers.
+// each avatar from the interpolated snapshot buffer.
 const roster = new Map<string, Identity>();
 
 // Platforms arrive via world_state (on join) and platform_added (live draws),
@@ -114,7 +134,7 @@ const roster = new Map<string, Identity>();
 const platforms = new Map<string, Platform>();
 
 // Minigame display state — populated *only* from server broadcasts, never
-// computed locally, mirroring latestPlayers/platforms's "server is sole
+// computed locally, mirroring snapshotBuffer/platforms's "server is sole
 // source of truth" posture. null means "nothing to show"; renderMinigameBanner
 // (built in startGame, alongside the rest of this connection's UI) is the one
 // place that turns these into what the player sees.
@@ -623,7 +643,15 @@ function startGame(roomId: string, identity: Identity) {
     switch (msg.type) {
       case "snapshot": {
         if (Array.isArray(msg.players)) {
-          latestPlayers = msg.players as PlayerSnapshot[];
+          const now = performance.now();
+          snapshotBuffer.push({ receivedAt: now, players: msg.players as PlayerSnapshot[] });
+          // Prune snapshots older than the current render window needs. We only ever
+          // need the one snapshot just-older than the render time, plus everything
+          // newer — keep buf[0] as that bracketing-older one and drop the rest.
+          const cutoff = now - INTERP_DELAY_MS;
+          while (snapshotBuffer.length > 2 && snapshotBuffer[1].receivedAt <= cutoff) {
+            snapshotBuffer.shift();
+          }
         } else {
           warnUnexpectedShape(msg.type, msg);
         }
@@ -917,8 +945,66 @@ function updateCountdownDisplay() {
   countdownEl.style.display = "";
 }
 
-function drawPlayers() {
-  for (const player of latestPlayers) {
+// Returns each player's position interpolated to `renderTime` (which is
+// deliberately in the past — see INTERP_DELAY_MS), blending the two snapshots
+// that bracket it. Purely a rendering transform over server-authoritative
+// positions: no physics, no prediction, the server is still the only thing that
+// decides where anyone actually is.
+function playersAt(renderTime: number): PlayerSnapshot[] {
+  const buf = snapshotBuffer;
+  if (buf.length === 0) return [];
+
+  // Find the newest snapshot at or before renderTime ("older"), and the one
+  // right after it ("newer").
+  let older: Snapshot | null = null;
+  let newer: Snapshot | null = null;
+  for (let i = buf.length - 1; i >= 0; i--) {
+    if (buf[i].receivedAt <= renderTime) {
+      older = buf[i];
+      newer = buf[i + 1] ?? null;
+      break;
+    }
+  }
+
+  // renderTime is before everything we have (just connected): show the oldest.
+  if (!older) return buf[0].players;
+  // renderTime is past the newest (server stalled / packets stopped): hold the
+  // last known positions. Deliberately NOT extrapolated — holding is safe and
+  // keeps this strictly "render server data," matching the no-client-physics rule.
+  if (!newer) return older.players;
+
+  const span = newer.receivedAt - older.receivedAt;
+  const t = span > 0 ? Math.max(0, Math.min(1, (renderTime - older.receivedAt) / span)) : 0;
+
+  const newerById = new Map(newer.players.map((p) => [p.id, p]));
+  const result: PlayerSnapshot[] = [];
+  for (const o of older.players) {
+    const n = newerById.get(o.id);
+    if (n) {
+      // Present in both: linear-interpolate position. vx/vy aren't used by
+      // drawPlayers, so carry the newer values through unchanged for shape parity.
+      result.push({
+        id: o.id,
+        x: o.x + (n.x - o.x) * t,
+        y: o.y + (n.y - o.y) * t,
+        vx: n.vx,
+        vy: n.vy,
+      });
+      newerById.delete(o.id);
+    } else {
+      // Only in the older snapshot (player left between the two) — draw last
+      // known spot; it disappears once `older` advances past it.
+      result.push(o);
+    }
+  }
+  // Anything left in newerById only appeared in the newer snapshot (just joined).
+  for (const n of newerById.values()) result.push(n);
+
+  return result;
+}
+
+function drawPlayers(players: PlayerSnapshot[]) {
+  for (const player of players) {
     const isMe = player.id === conn.id;
     const identity = roster.get(player.id);
 
@@ -945,7 +1031,7 @@ function frame() {
   drawErasePreview();
   drawPlatforms();
   drawCheese();
-  drawPlayers();
+  drawPlayers(playersAt(performance.now() - INTERP_DELAY_MS));
   drawInProgressPath();
   updateCountdownDisplay();
   requestAnimationFrame(frame);
