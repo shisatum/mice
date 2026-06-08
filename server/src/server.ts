@@ -1,5 +1,6 @@
 import type * as Party from "partykit/server";
 import Matter from "matter-js";
+import { ROOM_ID as DIRECTORY_ROOM_ID } from "./directory";
 
 const TICK_MS = 50; // ~20Hz, per the GDD's server-authoritative tick rate
 const SUB_STEP_MS = 1000 / 60;
@@ -45,6 +46,8 @@ const MAX_ERASE_HITS = 500; // generous cap on one batched erase message's segme
 // crossing several overlapping platforms) land nowhere near this; it only stops egregious abuse
 const MAX_CHAT_LENGTH = 240; // generous for a quick line of chat — comfortably under anything that'd overwhelm the log; enforced here AND as the client's <input maxlength>, but this copy is the one that actually matters
 const CHAT_COOLDOWN_MS = 400; // per-connection rate limit, per the GDD's "Rate Limiting" guidance — looser than DRAW_COOLDOWN_MS (chat never touches physics) but tight enough to block flooding; the same "spam guard, not a gameplay gate" posture ERASE_COOLDOWN_MS established
+const MAX_ACTIVITY_LOG = 50; // rolling join/leave/chat history replayed to new joiners via world_state — a "what did I miss" catch-up, not a permanent record, so it stays well under the client's MAX_CHAT_LOG=200 *display* cap; in-memory only (mirrors chat's existing "live conversation, no restore-on-restart expectation")
+const DIRECTORY_PING_INTERVAL_MS = 30_000; // periodic safety-net re-registration with the directory party (see directory.ts) — onConnect/onClose already ping on every player-count change, but a long-lived room with no joins/leaves would otherwise never refresh its lastSeen and could be filtered out as stale (directory.ts's STALE_AFTER_MS=90_000 is 3x this, tolerating a couple of missed beats)
 const COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
 const MAX_USERNAME_LENGTH = 20;
 const DEFAULT_AVATAR_COLOR = "#f4c95d";
@@ -243,6 +246,15 @@ type PlayerState = {
 
 type ConnState = { username: string; color: string };
 
+// A line in the rolling join/leave/chat history replayed to new joiners (see
+// activityLog/logActivity and world_state below). Join/leave carry structured
+// {kind, username} rather than pre-formatted text — display wording ("X joined")
+// stays a client concern, derived identically here and in the live player_joined/
+// player_left paths via client.ts's joinLeaveText, so the two can't drift apart.
+type ActivityEntry =
+  | { kind: "join" | "leave"; username: string }
+  | { kind: "chat"; username: string; color: string; text: string };
+
 export default class Server implements Party.Server {
   engine = Matter.Engine.create();
   players = new Map<string, PlayerState>();
@@ -251,9 +263,41 @@ export default class Server implements Party.Server {
   lastDrawAt = new Map<string, number>(); // connection id -> ms timestamp, for rate limiting
   lastEraseAt = new Map<string, number>(); // connection id -> ms timestamp, for rate limiting
   lastChatAt = new Map<string, number>(); // connection id -> ms timestamp, for rate limiting
+  activityLog: ActivityEntry[] = []; // rolling join/leave/chat history, capped at MAX_ACTIVITY_LOG — see logActivity
   tick = 0;
 
   constructor(readonly room: Party.Room) {}
+
+  // Appends to the rolling history and trims from the front — a plain array is
+  // fine at MAX_ACTIVITY_LOG=50 (shift's O(n) cost is trivial at this size), and
+  // keeps the type a flat ActivityEntry[] that world_state can send as-is.
+  private logActivity(entry: ActivityEntry) {
+    this.activityLog.push(entry);
+    if (this.activityLog.length > MAX_ACTIVITY_LOG) this.activityLog.shift();
+  }
+
+  // Best-effort registration ping to the directory party (see directory.ts) —
+  // reports this room's id and current player count so the join screen's room
+  // list can show it. Cross-party calls go through room.context.parties, which
+  // routes an HTTP request to the named party's room (here, "directory"'s
+  // singleton DIRECTORY_ROOM_ID room) — see Party.Context's doc comment ("Access
+  // other parties in this project"). Fire-and-forget by design: a missed ping
+  // just means this room briefly looks stale or absent in someone else's list,
+  // never a gameplay-affecting failure, so there's nothing worth retrying or
+  // awaiting (onConnect/onClose aren't async, and blocking either on a
+  // cross-party round trip would be a strange place to spend that latency).
+  private pingDirectory() {
+    this.room.context.parties.directory
+      .get(DIRECTORY_ROOM_ID)
+      .fetch({
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ roomId: this.room.id, playerCount: this.players.size }),
+      })
+      .catch(() => {
+        // see "fire-and-forget by design" above — nothing to do with a failure
+      });
+  }
 
   async onStart() {
     this.engine.gravity.y = 1;
@@ -304,6 +348,14 @@ export default class Server implements Party.Server {
 
     this.registerGroundDetection();
     setInterval(() => this.step(), TICK_MS);
+
+    // Periodic safety-net ping (see DIRECTORY_PING_INTERVAL_MS/pingDirectory) —
+    // skipped while empty: an empty room either has no directory entry yet, or
+    // already told the directory to drop it via onClose's playerCount:0 ping,
+    // and re-pinging here would just be wasted cross-party traffic.
+    setInterval(() => {
+      if (this.players.size > 0) this.pingDirectory();
+    }, DIRECTORY_PING_INTERVAL_MS);
   }
 
   // Builds physics bodies from a platform's point array, adds them to the
@@ -395,6 +447,12 @@ export default class Server implements Party.Server {
         color,
         owner,
       })),
+      // Catch-up history — what this joiner missed before they connected. Built
+      // (and the message sent) *before* logging this join below, mirroring how
+      // `players` above only describes pre-existing players: the joiner learns
+      // about their own join via the player_joined broadcast everyone receives,
+      // not by seeing it echoed back in their own history.
+      activity: this.activityLog,
     };
     conn.send(JSON.stringify(world_state));
 
@@ -423,6 +481,9 @@ export default class Server implements Party.Server {
     this.bodyIdToConnId.set(body.id, conn.id);
     Matter.World.add(this.engine.world, body);
 
+    this.logActivity({ kind: "join", username });
+    this.pingDirectory(); // player count just changed — let the directory's room list know
+
     // Broadcast to *everyone*, including the joiner — that's how they learn
     // their own (sanitized/fallback-applied) identity (world_state only
     // describes existing players).
@@ -438,6 +499,8 @@ export default class Server implements Party.Server {
     this.lastDrawAt.delete(conn.id);
     this.lastEraseAt.delete(conn.id);
     this.lastChatAt.delete(conn.id);
+    this.logActivity({ kind: "leave", username: state.username });
+    this.pingDirectory(); // player count just changed (possibly to zero — pingDirectory reports this.players.size, and the directory drops a room on a 0 count) — let the directory know either way
     this.room.broadcast(JSON.stringify({ type: "player_left", id: conn.id }));
   }
 
@@ -595,10 +658,11 @@ export default class Server implements Party.Server {
   // handleDraw/handleErase established for platforms. Username/color are read
   // from this connection's own tracked PlayerState (set once at onConnect,
   // already sanitized) rather than the message itself — the client supplies
-  // only the text, so there's nothing here for it to spoof. Deliberately not
-  // persisted: unlike platforms — part of the shared, persistent world that
-  // must survive a restart — chat is just the room's live conversation, with
-  // no "restore on restart" expectation (contrast handleDraw's storage.put).
+  // only the text, so there's nothing here for it to spoof. Still has no
+  // `room.storage` footprint — logActivity's in-memory rolling buffer is the
+  // one exception to "chat isn't persisted" (it resets on room respawn just
+  // like the rest of in-memory state), there purely so a joiner mid-conversation
+  // sees a few lines of catch-up rather than nothing, not as a permanent record.
   private handleChat(data: { text: string }, sender: Party.Connection) {
     const now = Date.now();
     const last = this.lastChatAt.get(sender.id) ?? 0;
@@ -611,6 +675,7 @@ export default class Server implements Party.Server {
     if (!state) return; // shouldn't happen on a live connection — guards a theoretical onMessage/onClose race
 
     this.lastChatAt.set(sender.id, now);
+    this.logActivity({ kind: "chat", username: state.username, color: state.color, text });
 
     this.room.broadcast(
       JSON.stringify({ type: "chat", id: sender.id, username: state.username, color: state.color, text })

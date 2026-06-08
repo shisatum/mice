@@ -131,6 +131,61 @@ canvas {
   color: #6c7280;
 }
 
+.room-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.room-list-entry {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  font: inherit;
+  background: #1b1d23;
+  border: 1px solid #353a47;
+  border-radius: 8px;
+  color: #f4f6fb;
+  cursor: pointer;
+  text-align: left;
+}
+
+.room-list-entry:hover {
+  border-color: #6ee7b7;
+}
+
+.room-list-count {
+  font-size: 12px;
+  color: #9aa0ad;
+}
+
+.room-list-empty {
+  font-size: 12px;
+  color: #6c7280;
+  font-style: italic;
+}
+
+/* #join-card .room-list-toggle (not just .room-list-toggle): #join-card label's
+   (id + element) selector outranks a bare class, so flex-direction/font-weight/
+   color would otherwise lose to that rule's column/600/#f4f6fb — this is a
+   casual checkbox+text row, not a field label wrapping an input. */
+#join-card .room-list-toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 400;
+  color: #6c7280;
+  cursor: pointer;
+}
+
+.room-list-toggle input {
+  margin: 0;
+}
+
 #join-submit {
   margin-top: 6px;
   padding: 10px;

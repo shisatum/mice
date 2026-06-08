@@ -83,6 +83,20 @@ type ChatEntry =
   | { kind: "chat"; username: string; color: string; text: string }
   | { kind: "system"; text: string };
 
+// Wire shape for world_state's replayed join/leave/chat history (mirrors
+// server.ts's ActivityEntry/activityLog). Join/leave arrive as structured
+// {kind, username} rather than pre-formatted text — joinLeaveText below turns
+// them into the same "<username> joined"/"<username> left" wording the live
+// player_joined/player_left cases already produce, so replayed and live system
+// entries read identically with the format defined in exactly one place.
+type ActivityEntry =
+  | { kind: "join" | "leave"; username: string }
+  | { kind: "chat"; username: string; color: string; text: string };
+
+function joinLeaveText(kind: "join" | "leave", username: string): string {
+  return kind === "join" ? `${username} joined` : `${username} left`;
+}
+
 const DEFAULT_AVATAR_COLOR = "#f4c95d"; // matches the server's DEFAULT_AVATAR_COLOR fallback
 
 let latestPlayers: PlayerSnapshot[] = [];
@@ -495,16 +509,27 @@ function startGame(roomId: string, identity: Identity) {
       }
       case "world_state": {
         // Full roster/platform replacement on join — replaces any stale entries
-        // from a previous connection to this room (e.g. after a reconnect).
-        // Both arrays are required together: a message that's half-valid is
+        // from a previous connection to this room (e.g. after a reconnect). All
+        // three arrays are required together: a message that's half-valid is
         // just as much "not the shape we expected" as one that's all wrong.
-        if (Array.isArray(msg.players) && Array.isArray(msg.platforms)) {
+        if (Array.isArray(msg.players) && Array.isArray(msg.platforms) && Array.isArray(msg.activity)) {
           roster.clear();
           for (const p of msg.players as { id: string; username: string; color: string }[]) {
             roster.set(p.id, { username: p.username, color: p.color });
           }
           platforms.clear();
           for (const p of msg.platforms as Platform[]) platforms.set(p.id, p);
+          // Catch-up history — replayed through the very same appendChatEntry
+          // the live join/leave/chat paths use, via the same joinLeaveText
+          // formatting, so a late joiner's log reads identically to having
+          // been there for it (just minus the timing).
+          for (const entry of msg.activity as ActivityEntry[]) {
+            appendChatEntry(
+              entry.kind === "chat"
+                ? { kind: "chat", username: entry.username, color: entry.color, text: entry.text }
+                : { kind: "system", text: joinLeaveText(entry.kind, entry.username) }
+            );
+          }
         } else {
           warnUnexpectedShape(msg.type, msg);
         }
@@ -518,7 +543,7 @@ function startGame(roomId: string, identity: Identity) {
           // local preview" pattern (see CLAUDE.md / Phases 5-6) rather than
           // reaching for a self-id check that conn.id might not even be
           // populated by yet at this exact moment in the connection lifecycle.
-          appendChatEntry({ kind: "system", text: `${msg.username} joined` });
+          appendChatEntry({ kind: "system", text: joinLeaveText("join", msg.username) });
         } else {
           warnUnexpectedShape(msg.type, msg);
         }
@@ -531,7 +556,7 @@ function startGame(roomId: string, identity: Identity) {
           // and the roster is the only place this client knows that mapping.
           const identity = roster.get(msg.id);
           roster.delete(msg.id);
-          if (identity) appendChatEntry({ kind: "system", text: `${identity.username} left` });
+          if (identity) appendChatEntry({ kind: "system", text: joinLeaveText("leave", identity.username) });
         } else {
           warnUnexpectedShape(msg.type, msg);
         }
@@ -685,6 +710,79 @@ const ROOM_CODE_LENGTH = 6;
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous 0/O/1/I/L
 const ROOM_CODE_PATTERN = /^[A-Z0-9]{1,12}$/;
 
+type DirectoryRoom = { roomId: string; playerCount: number };
+
+// Builds the URL to the directory party's singleton room (see directory.ts) —
+// the join screen's "active games" list is a plain cross-origin fetch, not a
+// PartySocket connection, so it needs a full URL rather than just a host.
+function directoryUrl(): string {
+  // Picks http/https the same way PartySocket picks ws/wss for PARTYKIT_HOST —
+  // a narrower check than partysocket's full private-IP-range sniffing suffices
+  // here, since this project's dev server only ever runs on 127.0.0.1 (see
+  // CLAUDE.md/TODO.md), never some other LAN address.
+  const protocol = PARTYKIT_HOST.startsWith("localhost:") || PARTYKIT_HOST.startsWith("127.0.0.1:") ? "http" : "https";
+  // "main" must match directory.ts's exported ROOM_ID — duplicated here because
+  // this is a separate (browser) bundle that can't import a backend module;
+  // same cross-boundary-constant pattern as DEFAULT_AVATAR_COLOR/MAX_CHAT_LENGTH.
+  return `${protocol}://${PARTYKIT_HOST}/parties/directory/main`;
+}
+
+// Best-effort: an unreachable directory (cold start, network hiccup, or simply
+// no rooms having pinged it yet) just yields an empty list — never a blocker to
+// creating or joining a room directly by code, which has always worked without it.
+async function fetchActiveRooms(): Promise<DirectoryRoom[]> {
+  try {
+    // The directory's player counts change by the second (rooms fill, empty,
+    // age out), so a browser-cached response — observed in testing to persist
+    // across reloads of this exact URL — would show stale numbers or hide
+    // freshly-emptied rooms indefinitely. This list is the one place staleness
+    // would visibly mislead a player about where to join.
+    const res = await fetch(directoryUrl(), { cache: "no-store" });
+    const data = asRecord(await res.json());
+    if (!data || !Array.isArray(data.rooms)) return [];
+    const rooms: DirectoryRoom[] = [];
+    for (const entry of data.rooms) {
+      const room = asRecord(entry);
+      if (room && isString(room.roomId) && isNumber(room.playerCount)) {
+        rooms.push({ roomId: room.roomId, playerCount: room.playerCount });
+      }
+    }
+    return rooms;
+  } catch {
+    return [];
+  }
+}
+
+// Replaces roomListEl's contents with either an empty-state note or one
+// clickable entry per active room — picking an entry hands its code to onPick
+// (which the join screen uses to fill the room-code field) rather than
+// reaching into the form directly, keeping this a dumb render function.
+function renderRoomList(roomListEl: HTMLElement, rooms: DirectoryRoom[], onPick: (roomId: string) => void) {
+  roomListEl.replaceChildren();
+  if (rooms.length === 0) {
+    const empty = document.createElement("p");
+    empty.classList.add("room-list-empty");
+    empty.textContent = "No active games right now — start your own below.";
+    roomListEl.appendChild(empty);
+    return;
+  }
+  for (const { roomId, playerCount } of rooms) {
+    const entry = document.createElement("button");
+    entry.type = "button";
+    entry.classList.add("room-list-entry");
+
+    const code = document.createElement("span");
+    code.textContent = roomId;
+    const count = document.createElement("span");
+    count.classList.add("room-list-count");
+    count.textContent = `${playerCount} ${playerCount === 1 ? "player" : "players"}`;
+    entry.append(code, count);
+
+    entry.addEventListener("click", () => onPick(roomId));
+    roomListEl.appendChild(entry);
+  }
+}
+
 function generateRoomCode(): string {
   let code = "";
   for (let i = 0; i < ROOM_CODE_LENGTH; i++) {
@@ -754,6 +852,38 @@ function buildJoinScreen() {
   }
   card.appendChild(colorPicker);
 
+  // Active-games list — sits above the room-code field so picking one is the
+  // natural first move, while typing/keeping a code remains just as available.
+  // Populated asynchronously below (after roomInput exists, since picking an
+  // entry fills it in); starts in a "loading" state rather than empty so a
+  // slow directory fetch doesn't briefly look identical to "no rooms active".
+  const roomListLabel = document.createElement("div");
+  roomListLabel.classList.add("join-field-label");
+  roomListLabel.textContent = "Active games";
+  card.appendChild(roomListLabel);
+
+  const roomList = document.createElement("div");
+  roomList.classList.add("room-list");
+  const loading = document.createElement("p");
+  loading.classList.add("room-list-empty");
+  loading.textContent = "Loading active games…";
+  roomList.appendChild(loading);
+  card.appendChild(roomList);
+
+  // Debug-only toggle: empty rooms are filtered out by default — joining one
+  // is meaningless (connecting just spins up a fresh room either way), so
+  // they'd only ever clutter the list — but seeing them is occasionally handy
+  // for watching room lifecycle/churn during development, hence "(debug)".
+  // Wiring (the `change` listener and the fetch that populates `activeRooms`)
+  // lives further below, alongside `refreshRoomList` — both need `roomInput`,
+  // declared next.
+  const emptyToggleLabel = document.createElement("label");
+  emptyToggleLabel.classList.add("room-list-toggle");
+  const emptyToggle = document.createElement("input");
+  emptyToggle.type = "checkbox";
+  emptyToggleLabel.append(emptyToggle, document.createTextNode(" Show empty rooms (debug)"));
+  card.appendChild(emptyToggleLabel);
+
   const roomLabel = document.createElement("label");
   roomLabel.textContent = "Room code";
   // Same reasoning as nameInput above — implicitly labeled, never looked up.
@@ -763,6 +893,28 @@ function buildJoinScreen() {
   roomInput.value = roomCodeFromUrl() ?? generateRoomCode();
   roomLabel.appendChild(roomInput);
   card.appendChild(roomLabel);
+
+  // Picking a room fills its code into the field and focuses it (rather than
+  // submitting immediately) — keeps "join a listed room" and "type/paste a
+  // code" the same one-button flow, and lets the player glance at/edit the
+  // code (or change their name/color) before committing.
+  //
+  // `activeRooms` holds the full fetched list (including empty rooms) so
+  // toggling the debug checkbox is a pure re-filter — no need to refetch.
+  let activeRooms: DirectoryRoom[] = [];
+  function refreshRoomList() {
+    const visible = emptyToggle.checked ? activeRooms : activeRooms.filter((room) => room.playerCount > 0);
+    renderRoomList(roomList, visible, (roomId) => {
+      roomInput.value = roomId;
+      roomInput.focus();
+    });
+  }
+  emptyToggle.addEventListener("change", refreshRoomList);
+
+  fetchActiveRooms().then((rooms) => {
+    activeRooms = rooms;
+    refreshRoomList();
+  });
 
   const hint = document.createElement("p");
   hint.classList.add("join-hint");
