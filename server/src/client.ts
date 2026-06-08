@@ -296,6 +296,8 @@ const keys: Keys = { left: false, right: false, jump: false };
 // `localX` is null until the first snapshot seeds it — there's nothing to
 // predict from before we know where the server actually put us.
 let localX: number | null = null;
+let lastServerVx = 0; // the local player's vx from the most recent snapshot — 0 after a wall collision (Matter.js zeroes it), ±MOVE_SPEED during free movement; used to detect blocked state and suppress prediction
+let lastKeyChangeTime = -Infinity; // timestamp of the last horizontal key state change — used for a grace period so wall-collision detection doesn't suppress prediction during the ~1-tick window before the server has processed a newly-pressed key
 const RECONCILE_BLEND = 0.15; // per-snapshot fraction to ease predicted x toward authority — small enough that corrections read as a gentle pull, not a snap
 const PREDICT_SNAP_PX = 64; // error past this = hard snap rather than smoothing through it (a desync this big means something other than network jitter — easing through it would just look like floating)
 
@@ -327,6 +329,22 @@ function predictLocalX(dtMs: number) {
   let dir = 0;
   if (keys.left) dir -= 1;
   if (keys.right) dir += 1;
+  if (dir === 0) return;
+  // Grace period: skip the wall-detection check for TICK_MS*2 after any
+  // horizontal key change. The server needs up to one full tick to process the
+  // new input and reply with a non-zero vx; applying the check before that
+  // snapshot arrives would suppress prediction for the first ~50ms of every
+  // key press (lastServerVx is 0 while the player was at rest), making the
+  // avatar feel unresponsive right at the moment the key is pressed.
+  const inGrace = performance.now() - lastKeyChangeTime < TICK_MS * 2;
+  if (!inGrace) {
+    // If the server's last reported vx doesn't agree with the held direction,
+    // the player is blocked — Matter.js zeroes vx after a collision with a
+    // static body (restitution=0) while applyMovement keeps requesting
+    // ±MOVE_SPEED. Don't predict past what the server says is reachable.
+    const sameDir = dir > 0 ? lastServerVx > 0 : lastServerVx < 0;
+    if (!sameDir) return;
+  }
   localX += dir * MOVE_SPEED * SUB_STEPS * (dtMs / TICK_MS);
   localX = Math.max(PLAYER_RADIUS, Math.min(WORLD_WIDTH - PLAYER_RADIUS, localX));
 }
@@ -355,11 +373,13 @@ function startGame(roomId: string, identity: Identity) {
       case "KeyA":
         changed = keys.left !== value;
         keys.left = value;
+        if (changed) lastKeyChangeTime = performance.now();
         break;
       case "ArrowRight":
       case "KeyD":
         changed = keys.right !== value;
         keys.right = value;
+        if (changed) lastKeyChangeTime = performance.now();
         break;
       case "ArrowUp":
       case "KeyW":
@@ -703,16 +723,19 @@ function startGame(roomId: string, identity: Identity) {
           // predictLocalX only ever fills the gap *until* the next of these.
           const me = players.find((p) => p.id === conn.id);
           if (me) {
+            lastServerVx = me.vx;
             if (localX === null) {
               localX = me.x; // seed on the very first snapshot — nothing to ease from yet
             } else {
               const error = me.x - localX;
-              // A small error is normal (the snapshot is already ~RTT+tick old
-              // by the time it arrives — see prediction_plan.md's "honest
-              // limitation"); ease toward it gently. A large one means a real
-              // desync (teleport, reconnect, knockback) — snap instead of
-              // smoothing through something that big.
-              if (Math.abs(error) > PREDICT_SNAP_PX) localX = me.x;
+              const dir = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+              // Gated by the same grace period as predictLocalX's sameDir check:
+              // don't snap for a blocked read during the window where lastServerVx
+              // is stale (0 from a resting state, not yet updated by the server's
+              // response to a newly-pressed key).
+              const inGrace = performance.now() - lastKeyChangeTime < TICK_MS * 2;
+              const blocked = !inGrace && dir !== 0 && (dir > 0 ? me.vx <= 0 : me.vx >= 0);
+              if (blocked || Math.abs(error) > PREDICT_SNAP_PX) localX = me.x;
               else localX += error * RECONCILE_BLEND;
             }
           }
