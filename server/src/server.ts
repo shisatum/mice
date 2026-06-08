@@ -15,23 +15,34 @@ const JUMP_SPEED = 11; // px/tick upward velocity applied on jump
 const PLATFORM_THICKNESS = 10; // px — matches the prototype's SEGMENT_THICKNESS
 const MAX_DRAW_POINTS = 500; // generous cap on a single stroke's (already RDP-simplified) point count
 const DRAW_COOLDOWN_MS = 1000; // per the GDD's physics-spam guidance: max one new platform per player per second
-// "Ink" budget — per the GDD's physics-spam guidance: cap active bodies per
-// player. This replaces an earlier flat MAX_PLATFORMS_PER_PLAYER=10 cap with a
-// segment-based one: createPlatformBodies emits one physics body per
-// consecutive point pair, so a platform's *real* cost is its segment count,
-// not "1 platform" regardless of length — a flat per-platform cap let a
-// maximally-long single stroke (up to MAX_DRAW_POINTS-1 segments) cost the same
-// "1" as a single dot, a ~70x spread between typical and worst-case load. 200
-// is roomier in the typical case (real RDP-simplified strokes run ~5-10
-// segments each, so this is "20-40 strokes" vs the old cap's flat 10) while
-// also *tightening* the worst-case bound (200 segments total vs the old
-// scheme's de-facto 10 x 499 ≈ 4990). See sendInkUpdate for how players see
-// their remaining budget as "ink left".
-const MAX_SEGMENTS_PER_PLAYER = 200;
+// "Ink" budget — per the GDD's physics-spam guidance: cap how many physics
+// bodies the room's whole shared canvas can hold at once. createPlatformBodies
+// emits one body per consecutive point pair, so total segment count *is* total
+// body count — and a live performance probe (a fresh isolated room, grown in
+// batches while sampling the ~20Hz snapshot broadcast's actual cadence) found
+// that's also almost exactly what determines whether Matter.Engine.update keeps
+// up: a flat ~50ms tick held rock-steady through 1,960 segments/40 platforms,
+// started jittering by 3,920/80 (10x the variance, a stray 97ms spike), and fell
+// off a cliff at 5,586/114 (≈896ms mean — an ~18x stall) and beyond (zero ticks
+// broadcast in a 10s window past ~144 platforms). 1200 sits with real margin
+// below the first sign of strain — comfortably more than "200/player x a
+// realistic handful of concurrent drawers" while staying far from the wall.
+//
+// This is *the room's* shared budget, not any one player's — reflecting that
+// the cost it bounds (physics tick time) is a shared-room property too: one
+// slow tick degrades the game for everyone in the room equally, regardless of
+// who drew what. See sendInkUpdate for how players see the room's "ink left".
+const MAX_SEGMENTS_PER_ROOM = 1200;
 const ERASE_COOLDOWN_MS = 250; // per-connection rate limit on erase, per the GDD's general "Rate Limiting" guidance —
 // erasing doesn't strain physics the way drawing does (it only ever removes bodies), so this is
 // deliberately looser than DRAW_COOLDOWN_MS; it just keeps a spam-right-clicker from hammering
-// storage.delete() and broadcast() rather than gating a gameplay mechanic
+// storage.delete() and broadcast() rather than gating a gameplay mechanic. Segment-erase batches
+// a whole drag gesture into one message (mirroring how `draw` batches a whole stroke), so this
+// single per-message cooldown naturally gates "once per drag" rather than "once per segment" —
+// no separate per-segment limiter needed.
+const MAX_ERASE_HITS = 500; // generous cap on one batched erase message's segment-hit count — same
+// order of magnitude as MAX_DRAW_POINTS, for the same reason: legitimate drags (even fast ones
+// crossing several overlapping platforms) land nowhere near this; it only stops egregious abuse
 const MAX_CHAT_LENGTH = 240; // generous for a quick line of chat — comfortably under anything that'd overwhelm the log; enforced here AND as the client's <input maxlength>, but this copy is the one that actually matters
 const CHAT_COOLDOWN_MS = 400; // per-connection rate limit, per the GDD's "Rate Limiting" guidance — looser than DRAW_COOLDOWN_MS (chat never touches physics) but tight enough to block flooding; the same "spam guard, not a gameplay gate" posture ERASE_COOLDOWN_MS established
 const COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
@@ -113,16 +124,39 @@ function isValidDraw(data: unknown): data is { type: "draw"; points: Point[]; co
   return points.every(isValidPoint);
 }
 
-// The id alone is enough to identify *which* platform — no further payload is
-// trusted or needed. Note that, by this game's deliberate "shared whiteboard"
-// design (anyone can erase anything), there is no owner check to bypass here:
-// trusting a client-claimed id grants nothing beyond what the permission model
-// already allows. The only things worth validating are the message shape and
-// that the platform still exists (handleErase checks the latter).
-function isValidErase(data: unknown): data is { type: "erase"; id: string } {
+// A single segment hit: which platform, and which of its consecutive-point-pair
+// segments (by index) the cursor crossed. The (platformId, segmentIndex) pair
+// alone is enough to identify *which segment* — no further payload is trusted
+// or needed. Note that, by this game's deliberate "shared whiteboard" design
+// (anyone can erase anything), there is no owner check to bypass here: trusting
+// a client-claimed id grants nothing beyond what the permission model already
+// allows. The only things worth validating are the message shape and that each
+// referenced platform/segment still exists (handleErase checks the latter,
+// since "still exists" can only be answered against live server state).
+function isValidEraseHit(hit: unknown): hit is { platformId: string; segmentIndex: number } {
+  if (typeof hit !== "object" || hit === null) return false;
+  const keys = Object.keys(hit);
+  if (keys.length !== 2) return false;
+  const { platformId, segmentIndex } = hit as Record<string, unknown>;
+  return (
+    typeof platformId === "string" &&
+    typeof segmentIndex === "number" &&
+    Number.isInteger(segmentIndex) &&
+    segmentIndex >= 0
+  );
+}
+
+// `hits` batches a whole right-click-drag gesture into one message — exactly
+// how `draw` already batches a whole stroke into one message on mouseup —
+// rather than sending one message per segment crossed. This is what lets the
+// existing per-message ERASE_COOLDOWN_MS keep working unchanged as a "once per
+// gesture" gate (see its comment) instead of needing a new per-segment limiter.
+function isValidErase(data: unknown): data is { type: "erase"; hits: { platformId: string; segmentIndex: number }[] } {
   if (typeof data !== "object" || data === null) return false;
-  const { type, id } = data as Record<string, unknown>;
-  return type === "erase" && typeof id === "string";
+  const { type, hits } = data as Record<string, unknown>;
+  if (type !== "erase") return false;
+  if (!Array.isArray(hits) || hits.length === 0 || hits.length > MAX_ERASE_HITS) return false;
+  return hits.every(isValidEraseHit);
 }
 
 // Chat messages carry only the text — identity (username/color) is read from
@@ -167,6 +201,28 @@ function createPlatformBodies(points: Point[]): Matter.Body[] {
     );
   }
   return bodies;
+}
+
+// Splits a point array around a set of removed segment indices into the
+// surviving contiguous runs — e.g. [A,B,C,D,E] (segments 0=A-B, 1=B-C, 2=C-D,
+// 3=D-E) with segment 1 removed becomes [[A,B],[C,D,E]]; removing segment 0
+// from a 2-point platform yields [] (the lone survivor B can't form a
+// platform by itself, so the whole thing vanishes). A run that collapses to a
+// single point — an orphaned endpoint, or both segments touching an interior
+// point getting erased — is discarded the same way: one point has no segments
+// and so no physics cost, exactly like an (already-rejected) 1-point draw.
+function splitPoints(points: Point[], removedSegments: Set<number>): Point[][] {
+  const pieces: Point[][] = [];
+  let runStart = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    if (!removedSegments.has(i)) continue;
+    const piece = points.slice(runStart, i + 1);
+    if (piece.length >= 2) pieces.push(piece);
+    runStart = i + 1;
+  }
+  const tail = points.slice(runStart);
+  if (tail.length >= 2) pieces.push(tail);
+  return pieces;
 }
 
 function makePlatformId(): string {
@@ -342,11 +398,12 @@ export default class Server implements Party.Server {
     };
     conn.send(JSON.stringify(world_state));
 
-    // A fresh connection owns nothing yet (its id is brand new), so this is
-    // always a `{used: 0, max: MAX_SEGMENTS_PER_PLAYER}` baseline — sent now so
-    // the "ink left" UI has real numbers from the moment the player can draw,
-    // rather than showing a placeholder until their first stroke lands.
-    this.sendInkUpdate(conn);
+    // The room's shared ink budget doesn't change just because someone joined —
+    // but the joiner's own UI needs *some* numbers immediately rather than a
+    // placeholder until the next draw/erase broadcast happens to fire. A plain
+    // conn.send (not the broadcast sendInkUpdate uses elsewhere) is correct
+    // here specifically because nothing actually changed for anyone else.
+    conn.send(JSON.stringify({ type: "ink", used: this.totalSegments(), max: MAX_SEGMENTS_PER_ROOM }));
 
     const body = Matter.Bodies.circle(WORLD_WIDTH / 2, WORLD_HEIGHT / 2 - 200, PLAYER_RADIUS, {
       label: "player",
@@ -416,29 +473,28 @@ export default class Server implements Party.Server {
     // anything else doesn't match a known shape — drop it silently
   }
 
-  // Sums the segment cost of every platform a connection owns — derived fresh
-  // from this.platforms each time, the same single-source-of-truth approach
-  // the erase feature's ownedCount used (see CLAUDE.md/TODO.md's "quota
-  // release" verification note: no separate counter to fall out of sync with
-  // what's actually in the world). Backs both the budget check in handleDraw
-  // and the "ink left" readout in sendInkUpdate.
-  private ownedSegments(ownerId: string): number {
+  // Sums the segment cost of every platform currently in the room — derived
+  // fresh from this.platforms each time, the same single-source-of-truth
+  // approach the erase feature's ownedCount established (see CLAUDE.md/TODO.md's
+  // "quota release" verification note: no separate counter to fall out of sync
+  // with what's actually in the world). Backs both the budget check in
+  // handleDraw and the "ink left" readout in sendInkUpdate. Room-wide rather
+  // than per-owner because the cost it bounds — physics tick time — is a
+  // room-wide property: it's spent on *every* body regardless of who drew it.
+  private totalSegments(): number {
     let total = 0;
-    for (const platform of this.platforms.values()) {
-      if (platform.owner === ownerId) total += segmentCount(platform.points);
-    }
+    for (const platform of this.platforms.values()) total += segmentCount(platform.points);
     return total;
   }
 
-  // Tells one connection how much of its segment "ink" budget it has left —
-  // sent right after world_state on join (so the UI has a real baseline before
-  // the player has drawn anything, rather than showing nothing/zero by default)
-  // and again after anything changes their usage: their own successful draws,
-  // and *any* erase of one of their platforms — including ones erased by other
-  // players, since this game's "anyone can erase anything" design (CLAUDE.md)
-  // means quota changes follow ownership, not who performed the action.
-  private sendInkUpdate(conn: Party.Connection) {
-    conn.send(JSON.stringify({ type: "ink", used: this.ownedSegments(conn.id), max: MAX_SEGMENTS_PER_PLAYER }));
+  // Tells the room how much of its shared segment "ink" budget is left —
+  // broadcast (not targeted: this is shared room state, the same "no
+  // special-cased local preview" pattern platform_added/platform_removed/chat
+  // all follow) right after world_state on join (so a joiner's UI has a real
+  // baseline immediately, never a placeholder) and again after anything changes
+  // the total: every accepted draw and every erase, by anyone, of anything.
+  private sendInkUpdate() {
+    this.room.broadcast(JSON.stringify({ type: "ink", used: this.totalSegments(), max: MAX_SEGMENTS_PER_ROOM }));
   }
 
   // Validates rate/cap limits (the GDD's "physics spam prevention"), creates
@@ -451,7 +507,7 @@ export default class Server implements Party.Server {
     if (now - last < DRAW_COOLDOWN_MS) return;
 
     const newSegments = segmentCount(data.points);
-    if (this.ownedSegments(sender.id) + newSegments > MAX_SEGMENTS_PER_PLAYER) return;
+    if (this.totalSegments() + newSegments > MAX_SEGMENTS_PER_ROOM) return;
 
     this.lastDrawAt.set(sender.id, now);
 
@@ -461,40 +517,77 @@ export default class Server implements Party.Server {
     await this.room.storage.put(id, platformData);
 
     this.room.broadcast(JSON.stringify({ type: "platform_added", id, ...platformData }));
-    this.sendInkUpdate(sender);
+    this.sendInkUpdate();
   }
 
-  // Removes a platform's bodies from the live world, drops it from the
-  // registry, and erases its persisted record — then broadcasts the removal
-  // to everyone (including the eraser, mirroring handleDraw's "no special-cased
-  // local preview" pattern). By this game's deliberate "anyone can erase
-  // anything" design (see CLAUDE.md), there's no owner check: any connection
-  // may name any existing platform id. A short per-connection cooldown is the
-  // only gate, guarding storage/broadcast traffic against spam-clicking rather
-  // than gating a gameplay mechanic the way DRAW_COOLDOWN_MS does.
-  private async handleErase(data: { id: string }, sender: Party.Connection) {
+  // Erases at the *segment* level, not the whole-platform level: a batch of
+  // (platformId, segmentIndex) hits — one right-click-drag gesture's worth,
+  // see isValidErase — gets grouped by platform, each platform's hit segments
+  // are cut out via splitPoints, and whatever survives on either side becomes
+  // its own fresh platform (new id, but the *original* color/owner carried
+  // through as passive provenance — see the PlatformData/owner note in
+  // CLAUDE.md for why that field stays even though no UI reads it anymore).
+  // Reusing the existing platform_removed/platform_added message types for
+  // splits — rather than inventing an atomic platform_split — keeps the
+  // protocol surface minimal: delivery over one ordered WebSocket already
+  // guarantees clients see "old gone, new pieces in" in that order, with no
+  // real risk of an inconsistent intermediate state to guard against.
+  //
+  // By this game's deliberate "anyone can erase anything" design (see
+  // CLAUDE.md), there's no owner check: any connection may name any existing
+  // platform/segment. The per-connection cooldown — now naturally gating
+  // "once per drag gesture" since a whole drag arrives as one message (see
+  // ERASE_COOLDOWN_MS's comment) — is the only gate, and (mirroring the old
+  // single-id version's behavior) is only consumed when there's real work to
+  // do, not on a batch that turns out to name nothing live.
+  private async handleErase(data: { hits: { platformId: string; segmentIndex: number }[] }, sender: Party.Connection) {
     const now = Date.now();
     const last = this.lastEraseAt.get(sender.id) ?? 0;
     if (now - last < ERASE_COOLDOWN_MS) return;
 
-    const platform = this.platforms.get(data.id);
-    if (!platform) return; // already erased by someone else, or never existed — nothing to do
+    // Group hits by platform, deduping segment indices — a drag can cross the
+    // same segment more than once (e.g. doubling back), and splitPoints wants
+    // a Set of indices, not a list with repeats.
+    const hitsByPlatform = new Map<string, Set<number>>();
+    for (const hit of data.hits) {
+      let segments = hitsByPlatform.get(hit.platformId);
+      if (!segments) hitsByPlatform.set(hit.platformId, (segments = new Set()));
+      segments.add(hit.segmentIndex);
+    }
 
-    this.lastEraseAt.set(sender.id, now);
+    let didErase = false;
+    for (const [platformId, removedSegments] of hitsByPlatform) {
+      const platform = this.platforms.get(platformId);
+      if (!platform) continue; // already erased (e.g. by someone else mid-drag), or never existed
 
-    Matter.World.remove(this.engine.world, platform.bodies);
-    this.platforms.delete(data.id);
-    await this.room.storage.delete(data.id);
+      // A segment index only makes sense against this platform's *current*
+      // point array — if anything's out of range, the client's view of this
+      // platform is stale (it changed shape since the cursor crossed it), so
+      // skip the whole platform's hits rather than guess at a mismatched cut.
+      const segCount = platform.points.length - 1;
+      let inRange = true;
+      for (const index of removedSegments) {
+        if (index >= segCount) { inRange = false; break; }
+      }
+      if (!inRange) continue;
 
-    this.room.broadcast(JSON.stringify({ type: "platform_removed", id: data.id }));
+      if (!didErase) { didErase = true; this.lastEraseAt.set(sender.id, now); }
 
-    // Erasing frees up the *platform's owner's* segment budget — not the
-    // eraser's, since "anyone can erase anything" means those can be different
-    // connections. Tell the owner directly if they're still around; if they've
-    // since disconnected there's no live client to update (they'll get a fresh
-    // baseline reading via sendInkUpdate next time they join).
-    const owner = this.room.getConnection(platform.owner);
-    if (owner) this.sendInkUpdate(owner);
+      Matter.World.remove(this.engine.world, platform.bodies);
+      this.platforms.delete(platformId);
+      await this.room.storage.delete(platformId);
+      this.room.broadcast(JSON.stringify({ type: "platform_removed", id: platformId }));
+
+      for (const piece of splitPoints(platform.points, removedSegments)) {
+        const pieceId = makePlatformId();
+        const pieceData: PlatformData = { points: piece, color: platform.color, owner: platform.owner };
+        this.addPlatform(pieceId, pieceData);
+        await this.room.storage.put(pieceId, pieceData);
+        this.room.broadcast(JSON.stringify({ type: "platform_added", id: pieceId, ...pieceData }));
+      }
+    }
+
+    if (didErase) this.sendInkUpdate();
   }
 
   // Sanitizes and rate-limits a chat message, then broadcasts it to everyone —

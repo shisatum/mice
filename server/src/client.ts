@@ -14,7 +14,6 @@ const PLATFORM_THICKNESS = 10; // matches the server's PLATFORM_THICKNESS / the 
 const MIN_POINT_DISTANCE = 4; // px — minimum spacing between captured drawing points, matches the prototype
 const RDP_EPSILON = 2; // px — Ramer-Douglas-Peucker tolerance; the bandwidth optimization the prototype deferred (see CLAUDE.md)
 const ERASE_HIT_TOLERANCE = PLATFORM_THICKNESS / 2 + 6; // px — how close a right-click must land to a platform's stroke to erase it; a little forgiveness beyond the visual half-thickness so thin/precise strokes stay easy to target
-const OWN_PLATFORM_HIGHLIGHT = "#6ee7b7"; // matches drawPlayers' "(you)" outline — reused here so "this is yours" reads as one consistent visual language
 const MAX_CHAT_LENGTH = 240; // mirrors the server's MAX_CHAT_LENGTH — caps the <input> so nothing gets typed that the server would just truncate anyway
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
@@ -98,24 +97,27 @@ const roster = new Map<string, Identity>();
 // rendering happens purely by regenerating geometry from each one's point array.
 const platforms = new Map<string, Platform>();
 
-// Right-click hit-testing: finds whichever platform's stroke passes closest to
-// `point`, within ERASE_HIT_TOLERANCE — checking every consecutive segment pair
-// the same way drawPlatformPath renders them, so "what you can click" always
-// matches "what you see". Picking by closest distance (rather than e.g. most-
-// recently-drawn / topmost) is deliberate: Map iteration order reflects each
-// client's own arrival order for these platforms — via world_state's storage
-// listing for pre-existing ones, live broadcasts for new ones — which can
-// differ between clients, so there's no globally-consistent "z-order" to pick
-// by. Closest-to-cursor is both simpler and more intuitive to aim.
-function findPlatformAt(point: Point): Platform | null {
-  let closest: Platform | null = null;
+// Right-click hit-testing: finds whichever *segment*, across every platform,
+// passes closest to `point` within ERASE_HIT_TOLERANCE — checking each
+// consecutive point pair the same way drawPlatformPath renders them, so "what
+// you can click" always matches "what you see". Picking by closest distance
+// (rather than e.g. most-recently-drawn / topmost) is deliberate: Map
+// iteration order reflects each client's own arrival order for these platforms
+// — via world_state's storage listing for pre-existing ones, live broadcasts
+// for new ones — which can differ between clients, so there's no globally-
+// consistent "z-order" to pick by. Closest-to-cursor is both simpler and more
+// intuitive to aim. Returns the segment's *index within its platform* (not the
+// segment's geometry) — that's what the server needs to cut the right piece
+// out of the right platform's point array (see splitPoints server-side).
+function findSegmentAt(point: Point): { platformId: string; segmentIndex: number } | null {
+  let closest: { platformId: string; segmentIndex: number } | null = null;
   let closestDist = ERASE_HIT_TOLERANCE;
   for (const platform of platforms.values()) {
     for (let i = 0; i < platform.points.length - 1; i++) {
       const dist = pointToSegmentDistance(point, platform.points[i], platform.points[i + 1]);
       if (dist < closestDist) {
         closestDist = dist;
-        closest = platform;
+        closest = { platformId: platform.id, segmentIndex: i };
       }
     }
   }
@@ -217,6 +219,14 @@ function canvasPoint(event: MouseEvent): Point {
 // drawInProgressPath can preview it regardless of where capture is wired up.
 let drawing: Point[] | null = null;
 
+// Right-click-drag erase capture: a platformId → segmentIndex-set accumulator,
+// alive only for the duration of one drag gesture (null between gestures,
+// mirroring `drawing`'s null-when-idle convention). Every segment the cursor
+// crosses gets recorded — Sets dedupe a drag doubling back over itself — and
+// on release the whole accumulated batch goes out as ONE `erase` message,
+// exactly how `drawing` collects a whole stroke before sending one `draw`.
+let erasing: Map<string, Set<number>> | null = null;
+
 let conn: PartySocket;
 
 // Opens the room connection and wires up everything that depends on it —
@@ -266,11 +276,21 @@ function startGame(roomId: string, identity: Identity) {
   // mirroring the prototype, then RDP-simplified and sent as a `draw` message
   // on stroke completion.
   canvas.addEventListener("mousedown", (event) => {
-    if (event.button !== 0) return; // only the primary (left) button draws — right-click is reserved for erasing (see contextmenu below)
+    if (event.button === 2) {
+      // Right button starts an erase drag — see `erasing`'s declaration and
+      // the contextmenu listener below (which only suppresses the native menu;
+      // the actual hit-testing lives here and in mousemove/mouseup, exactly
+      // mirroring how drawing capture spans mousedown/mousemove/mouseup).
+      erasing = new Map();
+      recordEraseHit(canvasPoint(event));
+      return;
+    }
+    if (event.button !== 0) return; // only the primary (left) button draws
     drawing = [canvasPoint(event)];
   });
 
   canvas.addEventListener("mousemove", (event) => {
+    if (erasing) recordEraseHit(canvasPoint(event));
     if (!drawing) return;
     const p = canvasPoint(event);
     if (distance(drawing[drawing.length - 1], p) >= MIN_POINT_DISTANCE) {
@@ -289,10 +309,38 @@ function startGame(roomId: string, identity: Identity) {
     }
   }
 
-  window.addEventListener("mouseup", finishDrawing);
+  // Records one hit-tested point into the in-progress erase-drag accumulator —
+  // shared by the initial mousedown (so a plain right-click-without-dragging
+  // still erases something) and every subsequent mousemove while dragging.
+  function recordEraseHit(point: Point) {
+    if (!erasing) return;
+    const hit = findSegmentAt(point);
+    if (!hit) return;
+    let segments = erasing.get(hit.platformId);
+    if (!segments) erasing.set(hit.platformId, (segments = new Set()));
+    segments.add(hit.segmentIndex);
+  }
 
-  // "Ink" meter — a small live readout of how much of the player's segment
-  // budget remains, kept current by the server's `ink` messages (see the
+  // Flushes the accumulated drag as ONE batched `erase` message — mirroring
+  // finishDrawing's "collect the whole gesture, send once on release" shape.
+  // The server is the final authority and will reject anything malformed or
+  // rate-limit-violating regardless of what this sends (see CLAUDE.md's
+  // "shared whiteboard"/"anyone can erase anything" rationale).
+  function finishErasing() {
+    if (!erasing) return;
+    const hits: { platformId: string; segmentIndex: number }[] = [];
+    for (const [platformId, segments] of erasing) {
+      for (const segmentIndex of segments) hits.push({ platformId, segmentIndex });
+    }
+    erasing = null;
+    if (hits.length > 0) conn.send(JSON.stringify({ type: "erase", hits }));
+  }
+
+  window.addEventListener("mouseup", finishDrawing);
+  window.addEventListener("mouseup", finishErasing);
+
+  // "Ink" meter — a small live readout of how much of the room's shared
+  // segment budget remains, kept current by the server's `ink` messages (see the
   // "ink" case in the message switch below, and sendInkUpdate server-side —
   // the server is the sole source of truth for the number; this just displays
   // it). Built here, alongside the rest of this connection's UI, rather than
@@ -303,16 +351,16 @@ function startGame(roomId: string, identity: Identity) {
   inkMeter.textContent = "Ink left: …"; // placeholder text until the server's baseline reading arrives (sent right after world_state on join — see onConnect)
   document.body.appendChild(inkMeter);
 
-  // Erasing — right-click a platform to remove it. Per this game's "shared
+  // Erasing — right-click-drag erases every segment the cursor crosses (see
+  // `erasing`/recordEraseHit/finishErasing above, wired into mousedown/
+  // mousemove/mouseup alongside drawing capture). Per this game's "shared
   // whiteboard" design, anyone can erase anything (see CLAUDE.md for the
   // rationale and trade-offs); the server is the final authority and will
   // reject malformed or rate-limit-violating attempts regardless of what this
-  // sends. preventDefault() suppresses the native context menu — there's
-  // nothing on this canvas that needs it.
+  // sends. All this listener does is preventDefault() to suppress the native
+  // context menu — there's nothing on this canvas that needs it.
   canvas.addEventListener("contextmenu", (event) => {
     event.preventDefault();
-    const target = findPlatformAt(canvasPoint(event));
-    if (target) conn.send(JSON.stringify({ type: "erase", id: target.id }));
   });
 
   // Chat — toggled open/closed with Enter (the window-level handler at the
@@ -543,28 +591,13 @@ function drawGround() {
 // the prototype's drawPlatform. Physics fidelity comes from the server's
 // deterministically-generated bodies (see CLAUDE.md's rendering convention);
 // this just needs to *look* like the same shape.
-function drawPlatformPath(points: Point[], color: string, isOwn = false) {
+function drawPlatformPath(points: Point[], color: string) {
   if (points.length < 2) return;
   ctx.beginPath();
   ctx.moveTo(points[0].x, points[0].y);
   for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-
-  // A dashed halo, in the same accent color drawPlayers uses to mark "(you)",
-  // stroked wider and underneath the platform's own color — so you can tell at
-  // a glance which strokes are yours (and therefore which ones right-clicking
-  // to erase would free up against MAX_PLATFORMS_PER_PLAYER) without changing
-  // how the platform itself looks to anyone, including its owner.
-  if (isOwn) {
-    ctx.save();
-    ctx.strokeStyle = OWN_PLATFORM_HIGHLIGHT;
-    ctx.lineWidth = PLATFORM_THICKNESS + 6;
-    ctx.setLineDash([6, 4]);
-    ctx.stroke();
-    ctx.restore();
-  }
-
   ctx.strokeStyle = color;
   ctx.lineWidth = PLATFORM_THICKNESS;
   ctx.stroke();
@@ -572,7 +605,7 @@ function drawPlatformPath(points: Point[], color: string, isOwn = false) {
 
 function drawPlatforms() {
   for (const platform of platforms.values()) {
-    drawPlatformPath(platform.points, platform.color, platform.owner === conn.id);
+    drawPlatformPath(platform.points, platform.color);
   }
 }
 
