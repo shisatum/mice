@@ -1,19 +1,14 @@
 import type * as Party from "partykit/server";
 import Matter from "matter-js";
 import { ROOM_ID as DIRECTORY_ROOM_ID } from "./directory";
+import {
+  TICK_MS, SUB_STEP_MS, SUB_STEPS, WORLD_WIDTH, WORLD_HEIGHT, GROUND_THICKNESS,
+  PLAYER_RADIUS, PLATFORM_THICKNESS, GRAVITY_Y,
+  type Point, type Keys,
+  isSupportingContact,
+} from "./physics";
+import { createPlatformBodies, applyMovement, createPlayerBody, createBoundaryBodies } from "./physics-bodies";
 
-const TICK_MS = 50; // ~20Hz, per the GDD's server-authoritative tick rate
-const SUB_STEP_MS = 1000 / 60;
-const SUB_STEPS = Math.round(TICK_MS / SUB_STEP_MS); // step physics at ~60Hz internally — Matter warns above ~16.7ms deltas and larger steps risk tunneling through thin bodies
-const WORLD_WIDTH = 1600;
-const WORLD_HEIGHT = 900;
-const GROUND_THICKNESS = 40;
-const WALL_THICKNESS = 40; // px — invisible boundary walls along the world's left/right/top edges (see onStart)
-const PLAYER_RADIUS = 16;
-const MOVE_SPEED = 5; // px/tick horizontal velocity while running — same feel as the prototype
-const JUMP_SPEED = 11; // px/tick upward velocity applied on jump
-
-const PLATFORM_THICKNESS = 10; // px — matches the prototype's SEGMENT_THICKNESS
 const MAX_DRAW_POINTS = 500; // generous cap on a single stroke's (already RDP-simplified) point count
 const DRAW_COOLDOWN_MS = 1000; // per the GDD's physics-spam guidance: max one new platform per player per second
 // "Ink" budget — per the GDD's physics-spam guidance: cap how many physics
@@ -130,8 +125,6 @@ function sanitizeChatText(raw: string): string {
   return raw.replace(CONTROL_CHARS, "").trim().slice(0, MAX_CHAT_LENGTH);
 }
 
-type Keys = { left: boolean; right: boolean; jump: boolean };
-
 function isValidInput(data: unknown): data is { type: "input"; keys: Keys } {
   if (typeof data !== "object" || data === null) return false;
   const { type, keys } = data as Record<string, unknown>;
@@ -139,8 +132,6 @@ function isValidInput(data: unknown): data is { type: "input"; keys: Keys } {
   const { left, right, jump } = keys as Record<string, unknown>;
   return typeof left === "boolean" && typeof right === "boolean" && typeof jump === "boolean";
 }
-
-type Point = { x: number; y: number };
 
 // Per the GDD's "Drawing Data: Numbers Only" security guidance: reject
 // strings, NaN/Infinity, extra keys, and out-of-bounds coordinates — anything
@@ -239,29 +230,6 @@ function isValidMinigameVote(data: unknown): data is { type: "minigame_vote"; vo
 // and the "ink left" readout (sendInkUpdate) share, so they can't drift apart.
 function segmentCount(points: Point[]): number {
   return Math.max(0, points.length - 1);
-}
-
-// Chain of thin static rectangles, one per consecutive point pair — identical
-// to the prototype's pointsToBodies; deterministic so every client can
-// regenerate matching cosmetic geometry from the same point array.
-function createPlatformBodies(points: Point[]): Matter.Body[] {
-  const bodies: Matter.Body[] = [];
-  for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i];
-    const b = points[i + 1];
-    const length = Math.hypot(b.x - a.x, b.y - a.y);
-    if (length < 0.5) continue; // skip degenerate zero-length segments
-    const angle = Math.atan2(b.y - a.y, b.x - a.x);
-    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-    bodies.push(
-      Matter.Bodies.rectangle(mid.x, mid.y, length, PLATFORM_THICKNESS, {
-        isStatic: true,
-        angle,
-        label: "platform",
-      })
-    );
-  }
-  return bodies;
 }
 
 // Splits a point array around a set of removed segment indices into the
@@ -410,45 +378,12 @@ export default class Server implements Party.Server {
   }
 
   async onStart() {
-    this.engine.gravity.y = 1;
+    this.engine.gravity.y = GRAVITY_Y;
 
-    // Static ground — mirrors the prototype's setup so a player dropped into
-    // the room always has something to land on, drawn platforms or not.
-    const ground = Matter.Bodies.rectangle(
-      WORLD_WIDTH / 2,
-      WORLD_HEIGHT - GROUND_THICKNESS / 2,
-      WORLD_WIDTH * 2,
-      GROUND_THICKNESS,
-      { isStatic: true, label: "platform" }
-    );
-
-    // Invisible boundary walls along the world's left/right/top edges. Without
-    // them a player can simply run — or, given a tall enough drawn structure,
-    // climb — straight past the visible canvas and disappear off-screen with
-    // no way back (the world has no camera/scrolling; everything within
-    // [0, WORLD_WIDTH] x [0, WORLD_HEIGHT] is the whole stage). Each wall sits
-    // just outside the world so its *inner* face is flush with the edge
-    // (x=0, x=WORLD_WIDTH, y=0), and is overlength to cover the corners.
-    //
-    // They reuse label "platform" rather than introducing a new label: the
-    // empirically-derived normal-sign check in registerGroundDetection already
-    // distinguishes "resting on top of" from "bumping into the side/underside
-    // of" *any* static body purely from contact geometry, so a side wall or
-    // ceiling can never be mistaken for ground to stand on and re-arm a jump.
-    const leftWall = Matter.Bodies.rectangle(
-      -WALL_THICKNESS / 2, WORLD_HEIGHT / 2, WALL_THICKNESS, WORLD_HEIGHT * 2,
-      { isStatic: true, label: "platform" }
-    );
-    const rightWall = Matter.Bodies.rectangle(
-      WORLD_WIDTH + WALL_THICKNESS / 2, WORLD_HEIGHT / 2, WALL_THICKNESS, WORLD_HEIGHT * 2,
-      { isStatic: true, label: "platform" }
-    );
-    const ceiling = Matter.Bodies.rectangle(
-      WORLD_WIDTH / 2, -WALL_THICKNESS / 2, WORLD_WIDTH * 2, WALL_THICKNESS,
-      { isStatic: true, label: "platform" }
-    );
-
-    Matter.World.add(this.engine.world, [ground, leftWall, rightWall, ceiling]);
+    // Static ground plus invisible boundary walls along the world's
+    // left/right/top edges — see physics.ts's createBoundaryBodies for why
+    // each exists and why all four safely reuse label "platform".
+    Matter.World.add(this.engine.world, createBoundaryBodies());
 
     // Restore platforms drawn before a restart/hibernation — PartyKit guarantees
     // onStart finishes (including this await) before the first onConnect fires,
@@ -482,20 +417,10 @@ export default class Server implements Party.Server {
   // Tracks how many platform contacts currently support each player from above
   // (a counter, rather than a boolean set on any contact, avoids flicker when
   // standing across overlapping segments — same approach as the prototype).
-  //
-  // A vertical contact normal alone isn't enough to mean "standing on": bumping
-  // your head on a platform's underside also produces a near-vertical normal,
-  // and would otherwise refresh the jump mid-air. Resolving which side the
-  // platform is on requires checking the normal's sign relative to which body
-  // in the pair is the player — Matter 0.20's SAT normal is *not* a simple
-  // "bodyA -> bodyB" center-to-center vector. This sign convention was derived
-  // empirically in the prototype (see prototype/index.html's isSupportingContact)
-  // and carries over unchanged: for a genuinely-supporting contact, normal.y is
-  // negative when the player is bodyA, and positive when the platform is bodyA.
+  // The actual "is this contact a supporting one" rule is shared with the
+  // client's local prediction sim — see physics.ts's isSupportingContact for
+  // why that predicate must be single-sourced.
   private registerGroundDetection() {
-    const isSupportingContact = (pair: Matter.Pair, player: Matter.Body) =>
-      pair.bodyA === player ? pair.collision.normal.y < -0.5 : pair.collision.normal.y > 0.5;
-
     const forEachSupportingContact = (
       event: Matter.IEventCollision<Matter.Engine>,
       visit: (state: PlayerState) => void
@@ -573,13 +498,7 @@ export default class Server implements Party.Server {
     // here specifically because nothing actually changed for anyone else.
     conn.send(JSON.stringify({ type: "ink", used: this.totalSegments(), max: MAX_SEGMENTS_PER_ROOM }));
 
-    const body = Matter.Bodies.circle(WORLD_WIDTH / 2, WORLD_HEIGHT / 2 - 200, PLAYER_RADIUS, {
-      label: "player",
-      friction: 0.05,
-      frictionAir: 0.01,
-      restitution: 0,
-      inertia: Infinity, // locked rotation, same as the prototype's avatar
-    });
+    const body = createPlayerBody(WORLD_WIDTH / 2, WORLD_HEIGHT / 2 - 200);
     this.players.set(conn.id, {
       body,
       username,
@@ -1013,21 +932,13 @@ export default class Server implements Party.Server {
     this.room.broadcast(JSON.stringify({ type: "minigame_started", game: "cheese_race", cheese }));
   }
 
-  // Direct-velocity movement and a one-shot, ground-gated jump — identical
-  // logic to the prototype's updatePlayer(), now driven by network input
-  // instead of local keyboard state.
+  // Reads ground state from this connection's PlayerState and hands off to the
+  // shared applyMovement (physics.ts) — the single-sourced movement model the
+  // client's local prediction sim also drives its body through, so the two can
+  // never apply two different rules (see CLAUDE.md's prediction convention).
   private applyInput(state: PlayerState) {
     const grounded = state.groundContacts > 0;
-
-    let vx = 0;
-    if (state.keys.left) vx -= MOVE_SPEED;
-    if (state.keys.right) vx += MOVE_SPEED;
-    Matter.Body.setVelocity(state.body, { x: vx, y: state.body.velocity.y });
-
-    if (state.keys.jump && !state.jumpHeld && grounded) {
-      Matter.Body.setVelocity(state.body, { x: state.body.velocity.x, y: -JUMP_SPEED });
-    }
-    state.jumpHeld = state.keys.jump;
+    state.jumpHeld = applyMovement(state.body, state.keys, state.jumpHeld, grounded);
   }
 
   step() {

@@ -1,35 +1,39 @@
 import "./styles.css";
 
 import PartySocket from "partysocket";
+import {
+  WORLD_WIDTH, WORLD_HEIGHT, GROUND_THICKNESS, PLAYER_RADIUS, PLATFORM_THICKNESS,
+  MOVE_SPEED, TICK_MS, SUB_STEPS,
+  type Point, type Keys,
+} from "./physics";
 
 declare const PARTYKIT_HOST: string;
 
-// Mirrors the world constants the room uses to build its physics scene —
-// keeping the client dumb (it only renders what the server tells it).
-const WORLD_WIDTH = 1600;
-const WORLD_HEIGHT = 900;
-const GROUND_THICKNESS = 40;
-const PLAYER_RADIUS = 16;
+// Everything that describes the *shared simulation* — world dimensions,
+// player/platform geometry, movement speed, tick rate, and the Point/Keys
+// shapes — is imported from physics.ts rather than hand-mirrored. This client
+// used to keep its own copies of these (a stale comment here claimed "this is
+// a separate bundle that can't import the backend module" — true of
+// directory.ts, which pulls in partykit/server, but physics.ts is a pure
+// shared module with zero server-runtime imports and is erased to nothing at
+// compile time when only its types/constants are used — see its header
+// comment for the empirical bundle-size proof). Faithful local prediction
+// (predictLocalX below) requires the *exact* model the server runs; a
+// hand-mirrored copy would only guarantee drift. See CLAUDE.md's note on this
+// single-sourcing convention change.
 const CHEESE_RADIUS = 14; // px — mirrors the server's CHEESE_RADIUS; purely cosmetic here, since the cheese is a server-authoritative target point with no physics body for this client to derive geometry from
-const PLATFORM_THICKNESS = 10; // matches the server's PLATFORM_THICKNESS / the prototype's SEGMENT_THICKNESS
 const MIN_POINT_DISTANCE = 4; // px — minimum spacing between captured drawing points, matches the prototype
 const RDP_EPSILON = 2; // px — Ramer-Douglas-Peucker tolerance; the bandwidth optimization the prototype deferred (see CLAUDE.md)
 const ERASE_HIT_TOLERANCE = PLATFORM_THICKNESS / 2 + 6; // px — how close a right-click must land to a platform's stroke to erase it; a little forgiveness beyond the visual half-thickness so thin/precise strokes stay easy to target
 const ERASE_PREVIEW_COLOR = "#ff6b6b"; // a "danger" red, deliberately outside PALETTE_COLORS' pastel set (and distinct from the "(you)" green) — communicates "about to be removed," not "an avatar/platform color choice"
 const MAX_CHAT_LENGTH = 240; // mirrors the server's MAX_CHAT_LENGTH — caps the <input> so nothing gets typed that the server would just truncate anyway
 
-// Mirrors the server's TICK_MS — the interval between position snapshots.
-// Kept as its own client-side copy for the same reason WORLD_WIDTH et al. are:
-// this is a separate (browser) bundle that can't import the backend module.
-// MUST stay in sync with server/src/server.ts's TICK_MS.
-const SERVER_TICK_MS = 50;
-
 // How far in the past to render, for entity interpolation. Two snapshot
 // intervals: one is the minimum (so there's normally a newer snapshot to tween
 // toward), the second is jitter/late-packet margin (one delayed or dropped
 // snapshot still leaves a bracket to interpolate within). Larger = smoother
 // under bad networks but more input latency on the local avatar.
-const INTERP_DELAY_MS = SERVER_TICK_MS * 2;
+const INTERP_DELAY_MS = TICK_MS * 2;
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 canvas.width = WORLD_WIDTH;
@@ -84,7 +88,6 @@ for (const color of PALETTE_COLORS) {
 document.body.appendChild(palette);
 
 type PlayerSnapshot = { id: string; x: number; y: number; vx: number; vy: number };
-type Point = { x: number; y: number };
 type Platform = { id: string; points: Point[]; color: string; owner: string };
 type Identity = { username: string; color: string };
 
@@ -280,12 +283,53 @@ let erasing: Map<string, Set<number>> | null = null;
 
 let conn: PartySocket;
 
+// Held-key state — module-level (hoisted out of startGame) so the module-level
+// frame()/predictLocalX can read it every frame; setKey (wired up inside
+// startGame, where the listeners and `chatOpen` it depends on live) is what
+// mutates it and sends `input` messages on change. Same "free function reads
+// shared module state" shape as countdownEl/conn below.
+const keys: Keys = { left: false, right: false, jump: false };
+
+// Local-player prediction state (Phase 1 — horizontal-only; see CLAUDE.md's
+// note on this being a deliberate, scoped exception to "the client does no
+// local physics or prediction," and prediction_plan.md for the staged design).
+// `localX` is null until the first snapshot seeds it — there's nothing to
+// predict from before we know where the server actually put us.
+let localX: number | null = null;
+const RECONCILE_BLEND = 0.15; // per-snapshot fraction to ease predicted x toward authority — small enough that corrections read as a gentle pull, not a snap
+const PREDICT_SNAP_PX = 64; // error past this = hard snap rather than smoothing through it (a desync this big means something other than network jitter — easing through it would just look like floating)
+
+// frame()'s own per-frame delta, for predictLocalX's dtMs. Reset right before
+// the render loop starts (see the bottom of startGame) so a long join-screen
+// pause before the first frame can't register as one enormous dtMs.
+let lastFrameTime = performance.now();
+
 // The large centered countdown readout — module-level (like `conn`) because
 // frame() (a free function, per this file's "render loop drives every visual
 // based on current state" shape) needs to update it every frame from
 // countdownStatus/Date.now(), but the element itself is built in startGame
 // alongside the rest of this connection's UI (see updateCountdownDisplay).
 let countdownEl: HTMLDivElement;
+
+// Predicts the local avatar's x immediately from its own held keys — removing
+// the ~INTERP_DELAY_MS lag for the dominant felt latency (running). y stays
+// interpolated (see frame()): jumps/falls still lag slightly behind input,
+// an accepted Phase 1 tradeoff (see prediction_plan.md). Mirrors the server's
+// direct-velocity horizontal model — applyMovement in physics-bodies.ts sets
+// `vx = ±MOVE_SPEED` once per tick, then the engine runs SUB_STEPS sub-steps
+// at SUB_STEP_MS each, so the actual displacement per tick is
+// MOVE_SPEED * SUB_STEPS. Integrating that at the per-frame rate
+// (MOVE_SPEED * SUB_STEPS * dtMs/TICK_MS) and clamping to the world's side
+// walls is a faithful, Matter-free rebuild of "where would the server be by
+// now" for pure horizontal motion.
+function predictLocalX(dtMs: number) {
+  if (localX === null) return;
+  let dir = 0;
+  if (keys.left) dir -= 1;
+  if (keys.right) dir += 1;
+  localX += dir * MOVE_SPEED * SUB_STEPS * (dtMs / TICK_MS);
+  localX = Math.max(PLAYER_RADIUS, Math.min(WORLD_WIDTH - PLAYER_RADIUS, localX));
+}
 
 // Opens the room connection and wires up everything that depends on it —
 // called once the join screen has collected the player's identity. Keeping
@@ -299,10 +343,10 @@ function startGame(roomId: string, identity: Identity) {
   });
 
   // Keyboard capture — sends an `input` message only when the {left,right,jump}
-  // state actually changes, rather than on every keydown/keyup repeat. The
-  // render loop stays purely snapshot-driven; this client does no local physics.
-  const keys = { left: false, right: false, jump: false };
-
+  // state actually changes, rather than on every keydown/keyup repeat. `keys`
+  // itself lives at module scope (see its declaration) so frame()/predictLocalX
+  // can read it every frame for local-player prediction; remote players still
+  // come purely from server snapshots — only the local avatar's x is predicted.
   function setKey(code: string, value: boolean) {
     if (chatOpen) return; // the chat input owns the keyboard while it's open — see the chat setup further down
     let changed = false;
@@ -644,13 +688,33 @@ function startGame(roomId: string, identity: Identity) {
       case "snapshot": {
         if (Array.isArray(msg.players)) {
           const now = performance.now();
-          snapshotBuffer.push({ receivedAt: now, players: msg.players as PlayerSnapshot[] });
+          const players = msg.players as PlayerSnapshot[];
+          snapshotBuffer.push({ receivedAt: now, players });
           // Prune snapshots older than the current render window needs. We only ever
           // need the one snapshot just-older than the render time, plus everything
           // newer — keep buf[0] as that bracketing-older one and drop the rest.
           const cutoff = now - INTERP_DELAY_MS;
           while (snapshotBuffer.length > 2 && snapshotBuffer[1].receivedAt <= cutoff) {
             snapshotBuffer.shift();
+          }
+
+          // Reconcile local-player prediction against this fresh authority —
+          // the server is still the sole source of truth (see CLAUDE.md);
+          // predictLocalX only ever fills the gap *until* the next of these.
+          const me = players.find((p) => p.id === conn.id);
+          if (me) {
+            if (localX === null) {
+              localX = me.x; // seed on the very first snapshot — nothing to ease from yet
+            } else {
+              const error = me.x - localX;
+              // A small error is normal (the snapshot is already ~RTT+tick old
+              // by the time it arrives — see prediction_plan.md's "honest
+              // limitation"); ease toward it gently. A large one means a real
+              // desync (teleport, reconnect, knockback) — snap instead of
+              // smoothing through something that big.
+              if (Math.abs(error) > PREDICT_SNAP_PX) localX = me.x;
+              else localX += error * RECONCILE_BLEND;
+            }
           }
         } else {
           warnUnexpectedShape(msg.type, msg);
@@ -846,6 +910,11 @@ function startGame(roomId: string, identity: Identity) {
     }
   });
 
+  // Reset right before the loop actually starts — frame()'s first dtMs is
+  // measured from here, not from module load (which could be an arbitrarily
+  // long join-screen pause earlier) or predictLocalX would integrate one
+  // enormous fictitious delta on its very first call.
+  lastFrameTime = performance.now();
   requestAnimationFrame(frame);
 }
 
@@ -1026,12 +1095,30 @@ function drawPlayers(players: PlayerSnapshot[]) {
 }
 
 function frame() {
+  const now = performance.now();
+  const dtMs = now - lastFrameTime;
+  lastFrameTime = now;
+
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawGround();
   drawErasePreview();
   drawPlatforms();
   drawCheese();
-  drawPlayers(playersAt(performance.now() - INTERP_DELAY_MS));
+
+  predictLocalX(dtMs);
+  // Remote players render exactly as before — pure interpolation of server
+  // data. Only the local entry gets its x replaced with the predicted value
+  // (y stays interpolated; see predictLocalX's "honest limitation" note).
+  // Build a fresh array rather than mutating playersAt's result in place: its
+  // "only in older"/"only in newer" branches return snapshot objects *by
+  // reference* from snapshotBuffer, and overwriting .x on one of those would
+  // permanently corrupt that buffered snapshot for every future frame's
+  // interpolation and reconciliation.
+  const players = playersAt(now - INTERP_DELAY_MS).map((player) =>
+    localX !== null && player.id === conn.id ? { ...player, x: localX } : player
+  );
+  drawPlayers(players);
+
   drawInProgressPath();
   updateCountdownDisplay();
   requestAnimationFrame(frame);
