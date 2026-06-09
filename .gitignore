@@ -27,3 +27,6 @@ Thumbs.db
 
 # Session-local lock file (PID + timestamp, machine-specific)
 .claude/scheduled_tasks.lock
+
+# Personal task notes — local only
+user_todo.txt
